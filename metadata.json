@@ -1,0 +1,12 @@
+{
+  "name": "Remix SentinelPrompt - Real-Time AI Rule \u0026 Violation Monitor",
+  "description": "Real-time violation tracking powered by natural language prompt rules. Live camera, screen, and text streams with automated compliance audits and instant incident alerts.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone",
+    "display-capture"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
