@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, useCallback } from 'react';
+import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import {
   Camera,
   Grid,
@@ -21,6 +21,11 @@ import { CameraFeed, CameraGroup, PromptRule, ViolationIncident } from '../types
 import { SimulationCanvas, SimulationHandle } from './SimulationCanvas';
 import { soundFx } from '../utils/audioAlert';
 import { safePostJson } from '../utils/apiClient';
+import { CameraStream, CameraSource } from './CameraStream';
+import { RoomPeoplePanel } from './RoomPeoplePanel';
+import { PersonRegistry } from '../utils/personRegistry';
+import { CameraPipeline, TargetPayload } from '../utils/cameraPipeline';
+import { needsConversion, convertToMp4 } from '../utils/videoConvert';
 
 interface MultiCameraMatrixProps {
   cameras: CameraFeed[];
@@ -50,6 +55,60 @@ export const MultiCameraMatrix: React.FC<MultiCameraMatrixProps> = ({
     lastLatency: number | null;
   }>>({});
 
+  // One room-wide identity registry; every camera's pipeline reports into it so a person keeps one ID everywhere
+  const registry = useMemo(() => new PersonRegistry(), []);
+  const pipelinesRef = useRef<Record<string, CameraPipeline>>({});
+  const getPipeline = useCallback(
+    (camId: string): CameraPipeline => {
+      if (!pipelinesRef.current[camId]) pipelinesRef.current[camId] = new CameraPipeline(camId, registry);
+      return pipelinesRef.current[camId];
+    },
+    [registry]
+  );
+  // Dev-only handle for inspecting the pipelines from the browser console / tests
+  useEffect(() => {
+    if (import.meta.env.DEV) (window as any).__vigil = { registry, pipelines: pipelinesRef.current };
+  }, [registry]);
+  const camNames = useMemo(() => Object.fromEntries(cameras.map((c) => [c.id, c.name])), [cameras]);
+
+  // Per-camera media source (device / video file). Real cameras only open after the user presses Start on that tile.
+  const [sources, setSources] = useState<Record<string, CameraSource>>({});
+  const [armed, setArmed] = useState<Record<string, boolean>>({});
+  // Video-file conversion (AVI, MKV, ... -> MP4): progress per camera, or an error message
+  const [converting, setConverting] = useState<Record<string, { percent: number } | { error: string } | undefined>>({});
+  const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
+
+  /** Converts a chosen file for a camera and swaps its source to the playable MP4. */
+  const convertFor = useCallback(async (camId: string, file: File) => {
+    setConverting((prev) => ({ ...prev, [camId]: { percent: 0 } }));
+    try {
+      const url = await convertToMp4(file, (percent) => setConverting((prev) => ({ ...prev, [camId]: { percent } })));
+      setSources((prev) => {
+        const old = prev[camId]?.fileUrl;
+        if (old && old.startsWith('blob:')) URL.revokeObjectURL(old);
+        return { ...prev, [camId]: { ...prev[camId], fileUrl: url, fileName: file.name, file, converted: true } };
+      });
+      setConverting((prev) => ({ ...prev, [camId]: undefined }));
+    } catch (err: any) {
+      console.warn('[convert] failed:', err);
+      setConverting((prev) => ({ ...prev, [camId]: { error: String(err?.message || err || 'Conversion failed') } }));
+    }
+  }, []);
+  const refreshDevices = useCallback(async () => {
+    try {
+      const all = await navigator.mediaDevices.enumerateDevices();
+      setDevices(all.filter((d) => d.kind === 'videoinput'));
+    } catch {
+      setDevices([]);
+    }
+  }, []);
+  useEffect(() => {
+    void refreshDevices();
+    navigator.mediaDevices?.addEventListener?.('devicechange', refreshDevices);
+    return () => navigator.mediaDevices?.removeEventListener?.('devicechange', refreshDevices);
+  }, [refreshDevices]);
+  const isLive = useCallback((c: CameraFeed) => c.sourceType === 'simulation' || !!armed[c.id], [armed]);
+
   // Simulation canvas refs for each camera
   const simRefs = useRef<Record<string, SimulationHandle | null>>({});
   const videoRefs = useRef<Record<string, HTMLVideoElement | null>>({});
@@ -78,9 +137,15 @@ export const MultiCameraMatrix: React.FC<MultiCameraMatrixProps> = ({
       if (activeRules.length === 0) return;
 
       let frameBase64: string | null = null;
+      let targets: TargetPayload[] = [];
       if (cam.sourceType === 'simulation') {
         const handle = simRefs.current[cam.id];
         frameBase64 = handle ? handle.captureFrame() : null;
+      } else if (armed[cam.id]) {
+        // Real feed: the frame plus one entry per identified person (crop, SAM mask, what the room knows about them)
+        const pipe = getPipeline(cam.id);
+        frameBase64 = pipe.captureFrame();
+        if (frameBase64) targets = await pipe.buildTargets(camNames);
       }
 
       if (!frameBase64) return;
@@ -104,6 +169,9 @@ export const MultiCameraMatrix: React.FC<MultiCameraMatrixProps> = ({
           rules: activeRules,
           context: contextStr,
           feedMode: cam.sourceType,
+          modelEngine: cam.worker.modelEngine,
+          targets: targets.length ? targets : undefined,
+          objects: targets.length ? [] : undefined,
         });
 
         const latency = Math.round(performance.now() - start);
@@ -126,6 +194,8 @@ export const MultiCameraMatrix: React.FC<MultiCameraMatrixProps> = ({
         if (data.success) {
           const violations = data.violations || [];
           const boxes: any[] = [];
+          const isReal = cam.sourceType !== 'simulation';
+          if (isReal) getPipeline(cam.id).applyVerdict(targets, violations, activeRules);
 
           if (violations.length > 0) {
             let hasCritical = false;
@@ -135,7 +205,8 @@ export const MultiCameraMatrix: React.FC<MultiCameraMatrixProps> = ({
               const severity = rule?.severity || 'high';
               if (severity === 'critical') hasCritical = true;
 
-              if (v.box2d) {
+              // Real feeds draw their own labelled overlay (CameraStream); simulation uses this box layer
+              if (v.box2d && !isReal) {
                 boxes.push({
                   ...v.box2d,
                   label: v.detectedLabel || 'Violation',
@@ -154,7 +225,11 @@ export const MultiCameraMatrix: React.FC<MultiCameraMatrixProps> = ({
                   category: rule?.category || 'safety',
                   streamType: 'visual',
                   confidence: v.confidence || 90,
-                  explanation: v.explanation,
+                  explanation: (() => {
+                    const t = targets.find((x) => x.id === v.targetId);
+                    const who = t?.globalId !== undefined ? registry.getPerson(t.globalId)?.label : undefined;
+                    return who ? `[${who}] ${v.explanation}` : v.explanation;
+                  })(),
                   detectedLabel: v.detectedLabel,
                   box2d: v.box2d,
                   cameraId: cam.id,
@@ -210,7 +285,7 @@ export const MultiCameraMatrix: React.FC<MultiCameraMatrixProps> = ({
         }));
       }
     },
-    [getRulesForCamera, groups, onViolationDetected, onUpdateCamera]
+    [getRulesForCamera, groups, onViolationDetected, onUpdateCamera, armed, getPipeline, camNames, registry]
   );
 
   const [quotaNotice, setQuotaNotice] = useState<boolean>(false);
@@ -218,7 +293,7 @@ export const MultiCameraMatrix: React.FC<MultiCameraMatrixProps> = ({
 
   // Round-robin or focused camera monitoring loop to prevent API rate-limit exhaustion
   useEffect(() => {
-    const activeCams = cameras.filter((c) => c.isMonitoring);
+    const activeCams = cameras.filter((c) => c.isMonitoring && isLive(c));
     if (activeCams.length === 0) return;
 
     const interval = setInterval(() => {
@@ -234,7 +309,7 @@ export const MultiCameraMatrix: React.FC<MultiCameraMatrixProps> = ({
     }, 3200);
 
     return () => clearInterval(interval);
-  }, [cameras, layout, focusedCameraId, evaluateCamera]);
+  }, [cameras, layout, focusedCameraId, evaluateCamera, isLive]);
 
   const filteredCameras = cameras.filter((cam) => {
     if (selectedGroupFilter === 'all') return true;
@@ -252,7 +327,7 @@ export const MultiCameraMatrix: React.FC<MultiCameraMatrixProps> = ({
         <div className="flex items-center gap-2 text-indigo-300">
           <Sparkles className="w-4 h-4 text-cyan-400 shrink-0" />
           <span>
-            <strong>Edge Perception Active</strong> (SAM 3.1 & ByteTrack Edge Engine). System is monitoring real-time prompt rules locally with zero API rate limits.
+            <strong>Edge Perception Active</strong> (simulation edge engine). System is monitoring real-time prompt rules locally with zero API rate limits.
           </span>
         </div>
         <span className="text-[10px] text-slate-400 font-mono">
@@ -315,6 +390,9 @@ export const MultiCameraMatrix: React.FC<MultiCameraMatrixProps> = ({
         </div>
       </div>
 
+      {/* Room-wide people registry: one ID per person across every camera */}
+      <RoomPeoplePanel registry={registry} camNames={camNames} />
+
       {/* Camera Matrix Grid */}
       <div
         className={`grid gap-4 ${
@@ -354,6 +432,13 @@ export const MultiCameraMatrix: React.FC<MultiCameraMatrixProps> = ({
                   <button
                     type="button"
                     onClick={() => {
+                      // A real camera that has not been opened yet: Start opens it
+                      if (cam.sourceType !== 'simulation' && !armed[cam.id]) {
+                        setArmed((prev) => ({ ...prev, [cam.id]: true }));
+                        if (!cam.isMonitoring) onUpdateCamera(cam.id, { isMonitoring: true });
+                        if (cam.sourceType === 'webcam') setTimeout(refreshDevices, 1500);
+                        return;
+                      }
                       if (cam.isMonitoring) {
                         simRefs.current[cam.id]?.clearCanvas?.();
                         setCameraEvaluations((prev) => ({
@@ -368,12 +453,12 @@ export const MultiCameraMatrix: React.FC<MultiCameraMatrixProps> = ({
                       onUpdateCamera(cam.id, { isMonitoring: !cam.isMonitoring });
                     }}
                     className={`px-2 py-0.5 rounded text-[11px] font-semibold border transition-colors ${
-                      cam.isMonitoring
+                      cam.isMonitoring && isLive(cam)
                         ? 'bg-rose-500/10 text-rose-300 border-rose-500/30 hover:bg-rose-500/20'
                         : 'bg-emerald-500/10 text-emerald-300 border-emerald-500/30 hover:bg-emerald-500/20'
                     }`}
                   >
-                    {cam.isMonitoring ? 'Pause' : 'Start'}
+                    {cam.isMonitoring && isLive(cam) ? 'Pause' : 'Start'}
                   </button>
 
                   {layout === 'grid' && (
@@ -392,6 +477,76 @@ export const MultiCameraMatrix: React.FC<MultiCameraMatrixProps> = ({
                 </div>
               </div>
 
+              {/* Source: simulation, a webcam (pick the device), a video file, or a shared screen */}
+              <div className="px-3 py-1.5 border-b border-slate-800/60 bg-slate-950/60 flex items-center gap-2 flex-wrap text-[11px]">
+                <span className="text-slate-500">Source</span>
+                <select
+                  value={cam.sourceType}
+                  onChange={(e) => {
+                    setArmed((prev) => ({ ...prev, [cam.id]: false }));
+                    onUpdateCamera(cam.id, { sourceType: e.target.value as CameraFeed['sourceType'] });
+                  }}
+                  className="bg-slate-900 border border-slate-700 rounded px-1.5 py-0.5 text-slate-200 focus:outline-none"
+                >
+                  <option value="simulation">Simulation</option>
+                  <option value="webcam">Webcam</option>
+                  <option value="video_file">Video file</option>
+                  <option value="screen">Screen share</option>
+                </select>
+                {cam.sourceType === 'webcam' && (
+                  <select
+                    value={sources[cam.id]?.deviceId || ''}
+                    onFocus={refreshDevices}
+                    onChange={(e) => setSources((prev) => ({ ...prev, [cam.id]: { ...prev[cam.id], deviceId: e.target.value || undefined } }))}
+                    className="bg-slate-900 border border-slate-700 rounded px-1.5 py-0.5 text-slate-200 focus:outline-none max-w-[180px]"
+                  >
+                    <option value="">Default camera</option>
+                    {devices.map((d, i) => (
+                      <option key={d.deviceId || i} value={d.deviceId}>
+                        {d.label || `Camera ${i + 1}`}
+                      </option>
+                    ))}
+                  </select>
+                )}
+                {cam.sourceType === 'video_file' && (
+                  <label className="cursor-pointer bg-slate-900 border border-slate-700 hover:border-slate-500 rounded px-1.5 py-0.5 text-slate-200 truncate max-w-[200px]">
+                    {sources[cam.id]?.fileName || 'Choose video…'}
+                    <input
+                      type="file"
+                      accept="video/*"
+                      className="hidden"
+                      onChange={(e) => {
+                        const f = e.target.files?.[0];
+                        if (!f) return;
+                        const old = sources[cam.id]?.fileUrl;
+                        if (old) URL.revokeObjectURL(old);
+                        if (needsConversion(f)) {
+                          // AVI / MKV / ...: the browser cannot play these, so convert to MP4 first
+                          setSources((prev) => ({ ...prev, [cam.id]: { ...prev[cam.id], fileUrl: undefined, fileName: f.name, file: f, converted: false } }));
+                          void convertFor(cam.id, f);
+                        } else {
+                          setConverting((prev) => ({ ...prev, [cam.id]: undefined }));
+                          setSources((prev) => ({ ...prev, [cam.id]: { ...prev[cam.id], fileUrl: URL.createObjectURL(f), fileName: f.name, file: f, converted: false } }));
+                        }
+                        e.target.value = '';
+                      }}
+                    />
+                  </label>
+                )}
+              </div>
+
+              {cam.sourceType === 'video_file' && converting[cam.id] && (
+                <div
+                  className={`px-3 py-1 text-[11px] border-b border-slate-800/60 ${
+                    'error' in (converting[cam.id] as object) ? 'bg-rose-500/10 text-rose-300' : 'bg-cyan-500/10 text-cyan-300'
+                  }`}
+                >
+                  {'error' in (converting[cam.id] as object)
+                    ? `Could not convert this video: ${(converting[cam.id] as { error: string }).error}. Try an MP4 or WebM file.`
+                    : `Converting ${sources[cam.id]?.fileName || 'video'} to MP4 for playback… ${(converting[cam.id] as { percent: number }).percent}%`}
+                </div>
+              )}
+
               {/* Viewport Feed Canvas */}
               <div className="relative aspect-video bg-black flex items-center justify-center overflow-hidden">
                 {cam.sourceType === 'simulation' ? (
@@ -408,10 +563,28 @@ export const MultiCameraMatrix: React.FC<MultiCameraMatrixProps> = ({
                       }}
                     />
                   </div>
+                ) : armed[cam.id] ? (
+                  <CameraStream
+                    cam={cam}
+                    source={sources[cam.id] || {}}
+                    pipeline={getPipeline(cam.id)}
+                    registry={registry}
+                    active={cam.isMonitoring}
+                    onUnplayable={() => {
+                      const f = sources[cam.id]?.file;
+                      if (f) void convertFor(cam.id, f);
+                    }}
+                  />
                 ) : (
-                  <div className="flex flex-col items-center justify-center text-slate-500 gap-1 text-xs">
+                  <div className="flex flex-col items-center justify-center text-slate-500 gap-1 text-xs text-center px-4">
                     <Camera className="w-6 h-6 text-slate-600" />
-                    <span>Live Hardware Stream</span>
+                    <span>
+                      {cam.sourceType === 'video_file'
+                        ? 'Choose a video file, then press Start'
+                        : cam.sourceType === 'screen'
+                          ? 'Press Start to share a screen'
+                          : 'Choose a camera, then press Start'}
+                    </span>
                   </div>
                 )}
 

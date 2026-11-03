@@ -32,7 +32,7 @@ export const INITIAL_CAMERAS: CameraFeed[] = [
     worker: {
       id: 'worker-cam-01',
       name: 'Agent Worker 01',
-      modelEngine: 'SAM 3.1 + Muse Spark',
+      modelEngine: 'Muse Spark 1.3',
       status: 'active',
       fps: 30,
       latencyMs: 38,
@@ -50,7 +50,7 @@ export const INITIAL_CAMERAS: CameraFeed[] = [
     worker: {
       id: 'worker-cam-02',
       name: 'Agent Worker 02',
-      modelEngine: 'SAM 3.1 + Muse Spark',
+      modelEngine: 'Muse Spark 1.3',
       status: 'active',
       fps: 30,
       latencyMs: 42,
@@ -68,7 +68,7 @@ export const INITIAL_CAMERAS: CameraFeed[] = [
     worker: {
       id: 'worker-cam-03',
       name: 'Agent Worker 03',
-      modelEngine: 'Llama 3.2 Vision',
+      modelEngine: 'Muse Spark 1.3',
       status: 'active',
       fps: 30,
       latencyMs: 35,
@@ -86,7 +86,7 @@ export const INITIAL_CAMERAS: CameraFeed[] = [
     worker: {
       id: 'worker-cam-04',
       name: 'Agent Worker 04',
-      modelEngine: 'SAM 3.1 + Muse Spark',
+      modelEngine: 'Muse Spark 1.3',
       status: 'idle',
       fps: 30,
       latencyMs: 45,

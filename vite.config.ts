@@ -11,6 +11,10 @@ export default defineConfig(() => {
   return {
     root: rootDir,
     plugins: [react(), tailwindcss()],
+    // ffmpeg.wasm spawns its own module worker from inside the package, which pre-bundling would break
+    optimizeDeps: {
+      exclude: ['@ffmpeg/ffmpeg', '@ffmpeg/util'],
+    },
     resolve: {
       alias: {
         '@': rootDir,
