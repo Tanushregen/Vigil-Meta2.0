@@ -19,6 +19,18 @@ import {
   Footprints,
   ShieldCheck,
 } from 'lucide-react';
+import { detectFromVideo, loadYolo, YoloDetection } from '../utils/yoloDetector';
+import { loadSam, segmentBoxes, maskedCropDataUrl, getSamBackend, switchSamBackend, cancelSam, SAM_MASK_SIZE, SegmentedTarget } from '../utils/samSegmenter';
+
+// How long a SAM silhouette stays on screen before the next scan refreshes it
+const MASK_TTL_MS = 8000;
+// Max time a scan waits for SAM before sending plain box crops instead
+const SAM_BUDGET_MS = 8000;
+// SAM starts on the CPU (own worker) so the GPU stays free for YOLO. If a pass takes longer than this the CPU is too
+// weak: move SAM to the GPU, and if that is also too slow, switch it off (stale masks are useless for rules)
+const SAM_SLOW_MS = 12000;
+// Max tracked targets sent to the reasoning model per scan
+const MAX_TARGETS = 6;
 import {
   PromptRule,
   ViolationIncident,
@@ -88,6 +100,20 @@ export const FeedViewport: React.FC<FeedViewportProps> = ({
   });
 
   const [trackedPeople, setTrackedPeople] = useState<TrackedPerson[]>([]);
+
+  // Local YOLOv10n detector (runs in-browser on every frame for webcam / screen / video file)
+  const [yoloStatus, setYoloStatus] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle');
+  const [yoloInfo, setYoloInfo] = useState<{ provider: string; ms: number } | null>(null);
+  const yoloStatusRef = useRef<'idle' | 'loading' | 'ready' | 'error'>('idle');
+  const yoloDetectionsRef = useRef<{ dets: YoloDetection[]; ts: number }>({ dets: [], ts: 0 });
+
+  // SAM 2.1 segmentation stage (box prompts from YOLO tracks -> masks -> background-free crops)
+  const [samEnabled, setSamEnabled] = useState<boolean>(true);
+  const [samStatus, setSamStatus] = useState<'idle' | 'loading' | 'ready' | 'error' | 'slow'>('idle');
+  const [samInfo, setSamInfo] = useState<{ provider: string; ms: number } | null>(null);
+  const samBusyRef = useRef<boolean>(false);
+  const trackedPeopleRef = useRef<TrackedPerson[]>([]);
+  const maskCacheRef = useRef<Map<number, { canvas: HTMLCanvasElement; box: BoundingBox; ts: number }>>(new Map());
 
   // Video and stream refs
   const videoRef = useRef<HTMLVideoElement | null>(null);
@@ -408,8 +434,46 @@ export const FeedViewport: React.FC<FeedViewportProps> = ({
                   pose,
                 };
               });
+            } else if (yoloStatusRef.current === 'ready') {
+              // 2. Webcam / screen / video file: real-time YOLO person detections (cloud AI only judges the rules)
+              const { dets, ts } = yoloDetectionsRef.current;
+              const fresh = performance.now() - ts < 1500 ? dets : [];
+              const phones = fresh.filter((d) => d.label === 'cell phone');
+              const overlaps = (a: BoundingBox, b: BoundingBox) =>
+                Math.min(a.xmax, b.xmax) > Math.max(a.xmin, b.xmin) &&
+                Math.min(a.ymax, b.ymax) > Math.max(a.ymin, b.ymin);
+              candidateDetections = fresh
+                .filter((d) => d.label === 'person' && d.score >= trackingSettings.minDetectionConfidence)
+                .map((d) => ({
+                  box: d.box,
+                  score: d.score,
+                  label: 'person',
+                  pose: estimateYoloPose(d.box, { holdingObject: phones.some((ph) => overlaps(ph.box, d.box)) }),
+                }));
+
+              // Other COCO objects (phones, laptops, bags, ...) as lightweight outlines
+              fresh
+                .filter((d) => d.label !== 'person' && d.score >= 0.4)
+                .forEach((d) => {
+                  const a = mapNormalizedToScreen(d.box.xmin, d.box.ymin, cWidth, cHeight);
+                  const b = mapNormalizedToScreen(d.box.xmax, d.box.ymax, cWidth, cHeight);
+                  ctx.save();
+                  ctx.strokeStyle = '#fbbf24';
+                  ctx.lineWidth = 1.5;
+                  ctx.setLineDash([5, 3]);
+                  ctx.strokeRect(a.x, a.y, b.x - a.x, b.y - a.y);
+                  ctx.setLineDash([]);
+                  ctx.font = 'bold 9px monospace';
+                  const tag = `${d.label} ${(d.score * 100).toFixed(0)}%`;
+                  const tw = ctx.measureText(tag).width + 8;
+                  ctx.fillStyle = '#fbbf24';
+                  ctx.fillRect(a.x, Math.max(0, a.y - 13), tw, 13);
+                  ctx.fillStyle = '#0f172a';
+                  ctx.fillText(tag, a.x + 4, Math.max(10, a.y - 3));
+                  ctx.restore();
+                });
             } else if (activeBoundingBoxes && activeBoundingBoxes.length > 0) {
-              // 2. For video, screen, or webcam: use AI violation & detection boxes with estimated pose
+              // 3. YOLO unavailable: fall back to boxes returned by the cloud vision model
               candidateDetections = activeBoundingBoxes.map((b) => {
                 const labelStr = b.label || '';
                 const pose = estimateYoloPose(b, {
@@ -427,6 +491,7 @@ export const FeedViewport: React.FC<FeedViewportProps> = ({
             // Update ByteTracker (Kalman motion filter + high/low 2-stage association)
             const activeTracks = byteTrackerRef.current.update(candidateDetections);
             setTrackedPeople(activeTracks);
+            trackedPeopleRef.current = activeTracks;
 
             // Render Tracks, Skeletons & Trajectories onto overlay canvas
             activeTracks.forEach((track) => {
@@ -435,6 +500,20 @@ export const FeedViewport: React.FC<FeedViewportProps> = ({
               const boxW = Math.max(10, pMax.x - pMin.x);
               const boxH = Math.max(10, pMax.y - pMin.y);
               const trackColor = track.color || getTrackColor(track.trackId);
+
+              // SAM silhouette: the mask captured at scan time, re-fitted onto the track's current box
+              const cachedMask = maskCacheRef.current.get(track.trackId);
+              if (cachedMask && performance.now() - cachedMask.ts < MASK_TTL_MS) {
+                const m = SAM_MASK_SIZE / 1000;
+                const sx = cachedMask.box.xmin * m;
+                const sy = cachedMask.box.ymin * m;
+                const sw = Math.max(1, (cachedMask.box.xmax - cachedMask.box.xmin) * m);
+                const sh = Math.max(1, (cachedMask.box.ymax - cachedMask.box.ymin) * m);
+                ctx.save();
+                ctx.imageSmoothingEnabled = true;
+                ctx.drawImage(cachedMask.canvas, sx, sy, sw, sh, pMin.x, pMin.y, boxW, boxH);
+                ctx.restore();
+              }
 
               // -------------------------------------------------------------
               // A. Draw Trajectory Breadcrumbs & Motion Path Trail
@@ -643,10 +722,180 @@ export const FeedViewport: React.FC<FeedViewportProps> = ({
     mapNormalizedToScreen,
   ]);
 
+  // ---------------------------------------------------------------------------
+  // Local YOLOv10n detection loop (webcam / screen / video file)
+  // ---------------------------------------------------------------------------
+  useEffect(() => {
+    if (feedMode === 'simulation' || !isMonitoring) return;
+
+    let cancelled = false;
+    const setStatus = (st: 'idle' | 'loading' | 'ready' | 'error') => {
+      yoloStatusRef.current = st;
+      setYoloStatus(st);
+    };
+
+    const run = async () => {
+      if (yoloStatusRef.current !== 'ready') setStatus('loading');
+      let provider = '';
+      try {
+        provider = (await loadYolo()).provider;
+      } catch (err) {
+        console.error('[YOLO] Failed to load model, falling back to cloud boxes', err);
+        if (!cancelled) setStatus('error');
+        return;
+      }
+      if (cancelled) return;
+      setStatus('ready');
+
+      let lastHud = 0;
+      while (!cancelled) {
+        const video = feedMode === 'video_file' ? fileVideoRef.current : videoRef.current;
+        if (!video || video.readyState < 2 || video.paused || video.ended || !video.videoWidth) {
+          await new Promise((r) => setTimeout(r, 100));
+          continue;
+        }
+        const t0 = performance.now();
+        try {
+          const dets = await detectFromVideo(video, { minScore: 0.3 });
+          if (cancelled) return;
+          const now = performance.now();
+          yoloDetectionsRef.current = { dets, ts: now };
+          if (now - lastHud > 1000) {
+            lastHud = now;
+            setYoloInfo({ provider, ms: Math.round(now - t0) });
+          }
+        } catch (err) {
+          console.warn('[YOLO] inference error', err);
+          await new Promise((r) => setTimeout(r, 500));
+        }
+        // Yield to the browser so rendering and the tracker stay smooth
+        await new Promise((r) => setTimeout(r, 0));
+      }
+    };
+
+    run();
+    return () => {
+      cancelled = true;
+      yoloDetectionsRef.current = { dets: [], ts: 0 };
+    };
+  }, [feedMode, isMonitoring]);
+
+  // ---------------------------------------------------------------------------
+  // Detection -> segmentation hand-off: YOLO tracks become SAM box prompts, SAM masks become
+  // background-free crops, and both go to the reasoning model alongside the rules.
+  // ---------------------------------------------------------------------------
+  const buildTargets = useCallback(async (): Promise<{
+    targets: Array<{ id: number; label: string; box: BoundingBox; masked: boolean; crop: string }>;
+    objects: Array<{ label: string; score: number; box: BoundingBox }>;
+  } | null> => {
+    if (feedMode === 'simulation' || yoloStatusRef.current !== 'ready') return null;
+    const hidden = hiddenCanvasRef.current;
+    if (!hidden || !hidden.width || !hidden.height) return null;
+
+    const area = (b: BoundingBox) => (b.xmax - b.xmin) * (b.ymax - b.ymin);
+    const tracks = trackedPeopleRef.current
+      .filter((t) => t.state === 'Tracked' && t.timeSinceUpdate === 0)
+      .sort((a, b) => area(b.box) - area(a.box))
+      .slice(0, MAX_TARGETS);
+    if (tracks.length === 0) return null;
+
+    // Freeze the frame: the shared capture canvas is overwritten by the next scan
+    const snap = document.createElement('canvas');
+    snap.width = hidden.width;
+    snap.height = hidden.height;
+    snap.getContext('2d')?.drawImage(hidden, 0, 0);
+
+    let segs: (SegmentedTarget | null)[] = tracks.map(() => null);
+    if (samEnabled && !samBusyRef.current) {
+      samBusyRef.current = true;
+      setSamStatus((st) => (st === 'ready' ? st : 'loading'));
+      const t0 = performance.now();
+      const work = segmentBoxes(
+        snap,
+        tracks.map((t) => t.box)
+      )
+        .then(async (res) => {
+          const now = performance.now();
+          const { provider } = await loadSam();
+          res.forEach((seg, i) => {
+            if (!seg) return;
+            const hex = (tracks[i].color || '#06b6d4').replace('#', '');
+            const [r, g, b] = [0, 2, 4].map((o) => parseInt(hex.slice(o, o + 2), 16) || 0);
+            const c = document.createElement('canvas');
+            c.width = SAM_MASK_SIZE;
+            c.height = SAM_MASK_SIZE;
+            const cx = c.getContext('2d');
+            if (!cx) return;
+            const img = cx.createImageData(SAM_MASK_SIZE, SAM_MASK_SIZE);
+            for (let k = 0; k < seg.mask.length; k++) {
+              if (seg.mask[k]) {
+                img.data[k * 4] = r;
+                img.data[k * 4 + 1] = g;
+                img.data[k * 4 + 2] = b;
+                img.data[k * 4 + 3] = 95;
+              }
+            }
+            cx.putImageData(img, 0, 0);
+            maskCacheRef.current.set(tracks[i].trackId, { canvas: c, box: seg.box, ts: now });
+          });
+          const ms = Math.round(now - t0);
+          setSamInfo({ provider, ms });
+          if (ms > SAM_SLOW_MS && getSamBackend() === 'cpu' && (navigator as any).gpu) {
+            console.warn(`[SAM] CPU pass took ${ms}ms; moving SAM to the GPU`);
+            switchSamBackend('webgpu');
+            setSamStatus('loading');
+          } else if (ms > SAM_SLOW_MS) {
+            console.warn(`[SAM] pass took ${ms}ms on ${provider}; disabling SAM on this device (box crops are used instead)`);
+            maskCacheRef.current.clear();
+            setSamEnabled(false);
+            setSamStatus('slow');
+          } else {
+            setSamStatus('ready');
+          }
+          return res;
+        })
+        .catch((err) => {
+          if (/cancelled|backend switched/.test(String(err?.message))) return null;
+          console.warn('[SAM] segmentation failed, sending plain box crops', err);
+          setSamStatus('error');
+          return null;
+        })
+        .finally(() => {
+          samBusyRef.current = false;
+        });
+      const budget = new Promise<null>((resolve) => setTimeout(() => resolve(null), SAM_BUDGET_MS));
+      const res = await Promise.race([work, budget]);
+      if (res) segs = res;
+    }
+
+    const targets = tracks.map((t, i) => {
+      const seg = segs[i];
+      const box = seg ? seg.box : t.box;
+      return {
+        id: t.trackId,
+        label: t.label || 'person',
+        box,
+        masked: !!seg,
+        crop: maskedCropDataUrl(snap, seg ? seg.mask : null, box),
+      };
+    });
+
+    const { dets, ts } = yoloDetectionsRef.current;
+    const objects =
+      performance.now() - ts < 1500
+        ? dets
+            .filter((d) => d.label !== 'person' && d.score >= 0.4)
+            .slice(0, 12)
+            .map((d) => ({ label: d.label, score: Math.round(d.score * 100) / 100, box: d.box }))
+        : [];
+
+    return { targets, objects };
+  }, [feedMode, samEnabled]);
+
   // Perform single scan evaluation against user prompt rules
   const evaluateActiveFrame = useCallback(
     async (overrideContext?: string) => {
-      if (isEvaluating) return;
+      if (isEvaluating || !isMonitoring) return;
 
       const activeRules = rules.filter(
         (r) => r.enabled && (r.streamType === 'visual' || r.streamType === 'both')
@@ -678,6 +927,12 @@ export const FeedViewport: React.FC<FeedViewportProps> = ({
           .filter(Boolean)
           .join('. ');
 
+        // YOLO tracks -> SAM masks -> per-target crops (null for simulation / when YOLO is unavailable)
+        const pipeline = await buildTargets();
+        if (sourceSessionIdRef.current !== requestSessionId) {
+          return;
+        }
+
         const { success, data, error } = await safePostJson(
           '/api/evaluate-frame',
           {
@@ -686,6 +941,8 @@ export const FeedViewport: React.FC<FeedViewportProps> = ({
             context: combinedContext,
             feedMode,
             modelEngine: selectedModel,
+            targets: pipeline?.targets,
+            objects: pipeline?.objects,
           },
           { signal: abortController.signal }
         );
@@ -781,15 +1038,32 @@ export const FeedViewport: React.FC<FeedViewportProps> = ({
     },
     [
       isEvaluating,
+      isMonitoring,
       rules,
       captureCurrentFrame,
       feedMode,
       videoFileName,
       operationalContext,
       onViolationDetected,
+      buildTargets,
       selectedModel,
     ]
   );
+
+  // Pausing stops every model: cancel the in-flight Gemini/Llama request, kill any running SAM pass,
+  // and drop overlays. YOLO and the scan timer already stop via their own isMonitoring effects.
+  useEffect(() => {
+    if (isMonitoring) return;
+    sourceSessionIdRef.current = Date.now(); // makes any late response from an in-flight scan get discarded
+    abortControllerRef.current?.abort();
+    abortControllerRef.current = null;
+    cancelSam();
+    samBusyRef.current = false;
+    setSamStatus((st) => (st === 'loading' ? 'idle' : st));
+    setIsEvaluating(false);
+    setActiveBoundingBoxes(null);
+    maskCacheRef.current.clear();
+  }, [isMonitoring]);
 
   // Periodically evaluate active frame
   useEffect(() => {
@@ -1127,11 +1401,70 @@ export const FeedViewport: React.FC<FeedViewportProps> = ({
             Ergonomics {trackingSettings.showErgonomicsBadge ? 'ON' : 'OFF'}
           </button>
 
+          <button
+            type="button"
+            onClick={() => setSamEnabled((v) => !v)}
+            className={`px-2.5 py-1 rounded-lg text-xs font-semibold border flex items-center gap-1.5 transition-colors cursor-pointer ${
+              samEnabled
+                ? 'bg-fuchsia-500/20 text-fuchsia-300 border-fuchsia-500/50'
+                : 'bg-slate-900 text-slate-500 border-slate-800 hover:text-slate-300'
+            }`}
+            title="Segment each YOLO box with SAM 2.1 before the rules model sees it"
+          >
+            <Sparkles className="w-3 h-3" />
+            SAM Masks {samEnabled ? 'ON' : 'OFF'}
+          </button>
+
           {/* Active Tracklets HUD Pill */}
           <div className="hidden lg:flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-slate-900 border border-slate-800 text-[11px] font-mono text-cyan-300">
             <span className="w-1.5 h-1.5 rounded-full bg-cyan-400 animate-ping" />
             <span>Tracked: {trackedPeople.length} Person{trackedPeople.length !== 1 ? 's' : ''}</span>
           </div>
+
+          {/* Local detector status */}
+          {feedMode !== 'simulation' && (
+            <div
+              className={`hidden lg:flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-slate-900 border text-[11px] font-mono ${
+                yoloStatus === 'ready'
+                  ? 'border-emerald-500/40 text-emerald-300'
+                  : yoloStatus === 'error'
+                    ? 'border-rose-500/40 text-rose-300'
+                    : 'border-slate-800 text-slate-400'
+              }`}
+              title="YOLOv10n running locally in your browser"
+            >
+              <Cpu className="w-3 h-3" />
+              {yoloStatus === 'ready' && yoloInfo
+                ? `YOLOv10n · ${yoloInfo.provider} · ${yoloInfo.ms}ms`
+                : yoloStatus === 'error'
+                  ? 'YOLO unavailable (cloud boxes)'
+                  : 'YOLOv10n loading…'}
+            </div>
+          )}
+
+          {feedMode !== 'simulation' && (samEnabled || samStatus === 'slow') && (
+            <div
+              className={`hidden lg:flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-slate-900 border text-[11px] font-mono ${
+                samStatus === 'ready'
+                  ? 'border-fuchsia-500/40 text-fuchsia-300'
+                  : samStatus === 'error'
+                    ? 'border-rose-500/40 text-rose-300'
+                    : 'border-slate-800 text-slate-400'
+              }`}
+              title="SAM 2.1 tiny segmenting YOLO boxes before rule evaluation"
+            >
+              <Sparkles className="w-3 h-3" />
+              {samStatus === 'ready' && samInfo
+                ? `SAM 2.1 · ${samInfo.provider} · ${(samInfo.ms / 1000).toFixed(1)}s`
+                : samStatus === 'error'
+                  ? 'SAM unavailable (box crops)'
+                  : samStatus === 'slow'
+                    ? 'SAM too slow here (box crops)'
+                  : samStatus === 'loading'
+                    ? 'SAM 2.1 segmenting…'
+                    : 'SAM 2.1 idle'}
+            </div>
+          )}
         </div>
       </div>
 
@@ -1215,6 +1548,16 @@ export const FeedViewport: React.FC<FeedViewportProps> = ({
               playsInline
               muted
               className="w-full h-full object-contain"
+              onLoadedMetadata={(e) => {
+                const v = e.currentTarget;
+                setVideoDimensions({ width: v.videoWidth, height: v.videoHeight });
+              }}
+              onResize={(e) => {
+                const v = e.currentTarget;
+                if (v.videoWidth && v.videoHeight) {
+                  setVideoDimensions({ width: v.videoWidth, height: v.videoHeight });
+                }
+              }}
             />
             {cameraError && (
               <div className="absolute inset-0 flex flex-col items-center justify-center p-6 text-center bg-slate-950/90 text-rose-300 gap-2">
@@ -1376,8 +1719,8 @@ export const FeedViewport: React.FC<FeedViewportProps> = ({
           <button
             type="button"
             onClick={() => evaluateActiveFrame()}
-            disabled={isEvaluating}
-            className="flex items-center gap-1 text-cyan-400 hover:text-cyan-300 font-medium cursor-pointer"
+            disabled={isEvaluating || !isMonitoring}
+            className="flex items-center gap-1 text-cyan-400 hover:text-cyan-300 font-medium cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
           >
             <RefreshCw className={`w-3 h-3 ${isEvaluating ? 'animate-spin' : ''}`} />
             Scan Now

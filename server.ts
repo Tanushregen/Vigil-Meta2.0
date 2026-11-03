@@ -14,6 +14,14 @@ const app = express();
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 const isProduction = process.env.NODE_ENV === 'production';
 
+// Cross-origin isolation enables multi-threaded WASM (SharedArrayBuffer) for the in-browser SAM worker.
+// "credentialless" keeps cross-origin resources such as Google Fonts working without CORP headers.
+app.use((_req: Request, res: Response, next: NextFunction) => {
+  res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+  res.setHeader('Cross-Origin-Embedder-Policy', 'credentialless');
+  next();
+});
+
 // Allow large payloads for base64 video frames
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
@@ -189,59 +197,57 @@ function evaluateFrameEdgeEngine(rules: PromptRule[], context?: string, feedMode
   return violations;
 }
 
-// Edge Fallback Text Stream Engine
-function evaluateTextEdgeEngine(rules: PromptRule[], text: string) {
-  const violations: any[] = [];
-  const lower = text.toLowerCase();
-
-  for (const rule of rules) {
-    const prompt = (rule.prompt + ' ' + rule.name).toLowerCase();
-
-    // PII / Credit Card / SSN
-    if (prompt.includes('ssn') || prompt.includes('credit card') || prompt.includes('pii') || prompt.includes('password')) {
-      const cardMatch = text.match(/\b(?:\d[ -]*?){13,16}\b/);
-      const ssnMatch = text.match(/\b\d{3}-\d{2}-\d{4}\b/);
-      const passMatch = lower.includes('password') || lower.includes('api_key') || lower.includes('bearer ');
-
-      if (cardMatch || ssnMatch || passMatch) {
-        violations.push({
-          ruleId: rule.id,
-          isViolated: true,
-          confidence: 99,
-          excerpt: cardMatch?.[0] || ssnMatch?.[0] || 'credential token',
-          explanation: 'Edge Compliance filter intercepted plaintext unmasked cardholder PII or credential token.',
-        });
-      }
-    }
-
-    // Hostility / Profanity
-    if (prompt.includes('hostil') || prompt.includes('profan') || prompt.includes('harass') || prompt.includes('abus')) {
-      const hostileWords = ['incompetent', 'unacceptable', 'sue', 'lawsuit', 'shut up', 'damn', 'hell', 'report this company'];
-      const matched = hostileWords.find((w) => lower.includes(w));
-      if (matched) {
-        violations.push({
-          ruleId: rule.id,
-          isViolated: true,
-          confidence: 94,
-          excerpt: matched,
-          explanation: 'Tone monitor flagged aggressive customer confrontation or hostile harassment keywords.',
-        });
-      }
-    }
+// Normalizes a model-returned box (object or [ymin,xmin,ymax,xmax] array, 0-1000) into a clamped box2d, or undefined if unusable.
+function normalizeViolationBox(v: any): { ymin: number; xmin: number; ymax: number; xmax: number } | undefined {
+  const raw = v?.box2d ?? v?.box_2d ?? v?.boundingBox ?? v?.bbox;
+  let ymin: number, xmin: number, ymax: number, xmax: number;
+  if (Array.isArray(raw) && raw.length === 4) {
+    [ymin, xmin, ymax, xmax] = raw.map(Number);
+  } else if (raw && typeof raw === 'object') {
+    ({ ymin, xmin, ymax, xmax } = { ymin: Number(raw.ymin), xmin: Number(raw.xmin), ymax: Number(raw.ymax), xmax: Number(raw.xmax) });
+  } else {
+    return undefined;
   }
+  if (![ymin, xmin, ymax, xmax].every(Number.isFinite)) return undefined;
+  const clamp = (n: number) => Math.max(0, Math.min(1000, Math.round(n)));
+  const box = {
+    ymin: clamp(Math.min(ymin, ymax)),
+    xmin: clamp(Math.min(xmin, xmax)),
+    ymax: clamp(Math.max(ymin, ymax)),
+    xmax: clamp(Math.max(xmin, xmax)),
+  };
+  if (box.ymax - box.ymin < 5 || box.xmax - box.xmin < 5) return undefined;
+  return box;
+}
 
-  return violations;
+function withNormalizedBoxes(violations: any[]): any[] {
+  return violations.map((v) => ({ ...v, box2d: normalizeViolationBox(v) }));
+}
+
+// A violation tied to a tracked target takes that target's (SAM-refined) box instead of any model-generated one.
+function attachTargetBoxes(violations: any[], targets: Array<{ id: number; box: any }>): any[] {
+  if (targets.length === 0) return violations;
+  const byId = new Map(targets.map((t) => [t.id, t.box]));
+  return violations.map((v) => {
+    const id = Number(v?.targetId);
+    return byId.has(id) ? { ...v, targetId: id, box2d: byId.get(id) } : v;
+  });
 }
 
 // Direct Meta Llama 3.2 Vision / Muse Spark API caller (if user configures META_LLAMA_API_KEY/URL)
-async function callDirectMetaLlamaApi(prompt: string, cleanBase64: string, modelName: string = 'Llama 3.2 Vision'): Promise<any | null> {
+async function callDirectMetaLlamaApi(prompt: string, cleanBase64: string, modelName: string = 'Llama 3.2 Vision', cropImages: string[] = []): Promise<any | null> {
   const apiKey = process.env.META_LLAMA_API_KEY;
   if (!apiKey) return null;
 
   const baseUrl = process.env.META_LLAMA_API_URL || 'https://api.together.xyz/v1';
-  const targetModel = modelName.includes('Muse Spark')
-    ? 'meta-llama/Llama-3.3-70B-Instruct'
-    : 'meta-llama/Llama-3.2-11B-Vision-Instruct';
+  // Meta's official Llama API uses bare model ids and serves vision via Llama 4; Together-style hosts use "meta-llama/..." ids.
+  const isOfficialLlamaApi = baseUrl.includes('api.llama.com');
+  const targetModel = process.env.META_LLAMA_MODEL
+    || (isOfficialLlamaApi
+      ? 'Llama-4-Maverick-17B-128E-Instruct-FP8'
+      : modelName.includes('Muse Spark')
+        ? 'meta-llama/Llama-3.3-70B-Instruct'
+        : 'meta-llama/Llama-3.2-11B-Vision-Instruct');
 
   try {
     const res = await fetch(`${baseUrl}/chat/completions`, {
@@ -253,12 +259,13 @@ async function callDirectMetaLlamaApi(prompt: string, cleanBase64: string, model
       body: JSON.stringify({
         model: targetModel,
         messages: [
-          { role: 'system', content: 'You are an authoritative real-time vision compliance auditor. Output strictly JSON with { "violations": [...], "sceneSummary": "..." }.' },
+          { role: 'system', content: 'You are an authoritative real-time vision compliance auditor. Output strictly JSON with { "violations": [{ "ruleId", "isViolated", "confidence", "explanation", "detectedLabel", "targetId", "box2d": { "ymin", "xmin", "ymax", "xmax" } }], "sceneSummary": "..." } where box2d values are integers 0-1000 and are mandatory for every violation.' },
           {
             role: 'user',
             content: [
               { type: 'text', text: prompt },
               { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${cleanBase64}` } },
+              ...cropImages.map((c) => ({ type: 'image_url', image_url: { url: `data:image/jpeg;base64,${c}` } })),
             ],
           },
         ],
@@ -295,10 +302,12 @@ async function callGeminiSafe(params: {
   // followed by gemini-flash-latest and gemini-3.8-flash.
   const candidateModels = [
     'gemini-3.1-flash-lite',
+    'gemini-2.5-flash',
     'gemini-flash-latest',
     'gemini-3.8-flash',
   ];
 
+  let quotaHits = 0;
   for (const model of candidateModels) {
     try {
       const response = await ai.models.generateContent({
@@ -308,6 +317,8 @@ async function callGeminiSafe(params: {
           responseMimeType: 'application/json',
           systemInstruction: params.systemInstruction,
           responseSchema: params.responseSchema,
+          // Live frames need low latency; skip the reasoning phase on 2.5 models.
+          ...(model.startsWith('gemini-2.5') ? { thinkingConfig: { thinkingBudget: 0 } } : {}),
         },
       });
 
@@ -326,12 +337,19 @@ async function callGeminiSafe(params: {
       }
 
       if (is429) {
-        tripQuotaCircuitBreaker(60); // Back off 60 seconds
-        return null;
+        // This model's free-tier quota is spent; other models have separate quotas, so keep cascading.
+        quotaHits++;
+        console.info(`[Meta Cognitive Pipeline] Model ${model} quota exhausted (429). Cascading to alternate engine...`);
+        continue;
       }
 
       console.warn(`[Meta Cognitive Pipeline] Engine check for ${model}:`, err?.message || err);
     }
+  }
+
+  // Back off only when every model was quota-limited, not when a single one was.
+  if (quotaHits === candidateModels.length) {
+    tripQuotaCircuitBreaker(60);
   }
 
   return null;
@@ -351,7 +369,7 @@ app.get('/api/health', (_req: Request, res: Response) => {
 // Real-time Visual Frame Violation Evaluation with Meta Llama 3.2 Vision / Muse Spark
 app.post('/api/evaluate-frame', async (req: Request, res: Response) => {
   try {
-    const { imageBase64, rules, context, feedMode, modelEngine = 'Llama 3.2 Vision' } = req.body;
+    const { imageBase64, rules, context, feedMode, modelEngine = 'Llama 3.2 Vision', targets: rawTargets, objects: rawObjects } = req.body;
 
     if (!imageBase64 || typeof imageBase64 !== 'string') {
       return res.status(400).json({ error: 'Missing or invalid imageBase64' });
@@ -403,6 +421,33 @@ app.post('/api/evaluate-frame', async (req: Request, res: Response) => {
     }
 
     const cleanBase64 = imageBase64.replace(/^data:image\/\w+;base64,/, '');
+
+    // Detection -> segmentation hand-off from the browser: YOLO tracks, SAM-refined boxes and masked crops.
+    const targets: Array<{ id: number; label: string; box: { ymin: number; xmin: number; ymax: number; xmax: number }; masked: boolean; crop: string }> = [];
+    for (const t of Array.isArray(rawTargets) ? rawTargets.slice(0, 8) : []) {
+      const box = normalizeViolationBox({ box2d: t?.box });
+      if (!Number.isInteger(t?.id) || !box || typeof t?.crop !== 'string') continue;
+      targets.push({
+        id: t.id,
+        label: String(t.label || 'person').slice(0, 40),
+        box,
+        masked: !!t.masked,
+        crop: t.crop.replace(/^data:image\/\w+;base64,/, ''),
+      });
+    }
+    const objects = (Array.isArray(rawObjects) ? rawObjects.slice(0, 12) : [])
+      .map((o: any) => ({ label: String(o?.label || '').slice(0, 40), score: Number(o?.score) || 0, box: normalizeViolationBox({ box2d: o?.box }) }))
+      .filter((o) => o.label && o.box);
+    const hasTargets = targets.length > 0;
+    const targetPromptText = hasTargets
+      ? `
+PRE-DETECTED TARGETS (YOLOv10 detector + SAM 2.1 segmentation, tracked by ID). Boxes are normalized 0-1000 [ymin, xmin, ymax, xmax]:
+${targets
+  .map((t) => `- Target #${t.id} (${t.label}) box [${t.box.ymin}, ${t.box.xmin}, ${t.box.ymax}, ${t.box.xmax}] - ${t.masked ? 'background removed with SAM mask' : 'plain box crop'}; its crop image follows the full frame`)
+  .join('\n')}
+${objects.length ? `Other detected objects: ${objects.map((o) => `${o.label} (${Math.round(o.score * 100)}%) [${o.box!.ymin}, ${o.box!.xmin}, ${o.box!.ymax}, ${o.box!.xmax}]`).join('; ')}` : ''}
+Judge every rule PER TARGET using its crop (gray background = removed by the mask). When a violation belongs to a target, set "targetId" to that target's ID. Do not return box2d for target violations; the system uses the target's own box. For scene-level rules that no target satisfies (e.g. nobody present, restricted object), omit targetId and give box2d if you can localize it.`
+      : '';
     const rulesPromptText = activeRules
       .map(
         (r, idx) =>
@@ -414,7 +459,7 @@ Condition to detect: "${r.prompt}"`
     const prompt = `You are an authoritative Meta AI real-time vision compliance auditor (${modelEngine}).
 Analyze this video frame carefully against the following active prompt rules:
 ${rulesPromptText}
-${context ? `Operational Environment: ${context}` : ''}
+${context ? `Operational Environment: ${context}` : ''}${targetPromptText}
 
 CRITICAL RULES:
 1. ONLY flag a violation if you visually observe clear evidence of the violation in this specific frame.
@@ -425,13 +470,14 @@ CRITICAL RULES:
    - confidence: 50-100
    - explanation: clear concise description of what is visible in the frame
    - detectedLabel: brief label (e.g. "Missing Hardhat", "Phone in Hand", "Missing Vest")
-   - box2d: tight normalized bounding box {ymin, xmin, ymax, xmax} between 0 and 1000 around the exact violating object or person.
+   - targetId: ID of the pre-detected target that violates the rule (only when targets are listed above)
+   - box2d: REQUIRED unless targetId is set. Tight bounding box {"ymin": int, "xmin": int, "ymax": int, "xmax": int} in normalized image coordinates 0-1000 (origin top-left, ymin/xmin = top-left corner, ymax/xmax = bottom-right corner) around the exact violating person or object. Never omit it.
 DO NOT invent or hallucinate violations that are not visible in the frame. If in doubt or no violation is present, return empty array.`;
 
     // 2. Check if direct Meta Llama API is configured
-    const directMetaResult = await callDirectMetaLlamaApi(prompt, cleanBase64, modelEngine);
+    const directMetaResult = await callDirectMetaLlamaApi(prompt, cleanBase64, modelEngine, targets.map((t) => t.crop));
     if (directMetaResult) {
-      const confirmed = (directMetaResult.violations || []).filter((v: any) => v.isViolated === true);
+      const confirmed = attachTargetBoxes(withNormalizedBoxes((directMetaResult.violations || []).filter((v: any) => v.isViolated === true)), targets);
       return res.json({
         success: true,
         timestamp: new Date().toISOString(),
@@ -458,6 +504,7 @@ DO NOT invent or hallucinate violations that are not visible in the frame. If in
               confidence: { type: Type.INTEGER },
               explanation: { type: Type.STRING },
               detectedLabel: { type: Type.STRING },
+              targetId: { type: Type.INTEGER },
               box2d: {
                 type: Type.OBJECT,
                 properties: {
@@ -466,9 +513,12 @@ DO NOT invent or hallucinate violations that are not visible in the frame. If in
                   ymax: { type: Type.INTEGER },
                   xmax: { type: Type.INTEGER },
                 },
+                required: ['ymin', 'xmin', 'ymax', 'xmax'],
               },
             },
-            required: ['ruleId', 'isViolated', 'confidence', 'explanation'],
+            required: hasTargets
+              ? ['ruleId', 'isViolated', 'confidence', 'explanation', 'detectedLabel']
+              : ['ruleId', 'isViolated', 'confidence', 'explanation', 'detectedLabel', 'box2d'],
           },
         },
         sceneSummary: { type: Type.STRING },
@@ -480,6 +530,10 @@ DO NOT invent or hallucinate violations that are not visible in the frame. If in
       contents: {
         parts: [
           { inlineData: { mimeType: 'image/jpeg', data: cleanBase64 } },
+          ...targets.flatMap((t) => [
+            { text: `Crop of Target #${t.id} (${t.label}):` },
+            { inlineData: { mimeType: 'image/jpeg', data: t.crop } },
+          ]),
           { text: prompt },
         ],
       },
@@ -520,7 +574,7 @@ DO NOT invent or hallucinate violations that are not visible in the frame. If in
       parsedData = { violations: [] };
     }
 
-    const confirmed = (parsedData.violations || []).filter((v: any) => v.isViolated === true);
+    const confirmed = attachTargetBoxes(withNormalizedBoxes((parsedData.violations || []).filter((v: any) => v.isViolated === true)), targets);
     const summaryText = parsedData.sceneSummary
       ? `[Meta ${modelEngine}] ${parsedData.sceneSummary}`
       : `[Meta ${modelEngine}] Frame evaluated with zero prompt rule infractions.`;
@@ -544,121 +598,6 @@ DO NOT invent or hallucinate violations that are not visible in the frame. If in
       timestamp: new Date().toISOString(),
       modelEngine: `Meta ${modelEngine}`,
       sceneSummary: isSim ? `[Meta ${modelEngine}] Simulation Engine Active` : `[Meta ${modelEngine}] Video feed active`,
-      violations: edgeViolations,
-      isEdgeFallback: true,
-    });
-  }
-});
-
-// Real-time Text / Stream Feed Violation Evaluation
-app.post('/api/evaluate-text', async (req: Request, res: Response) => {
-  try {
-    const { text, rules, context } = req.body;
-
-    if (!text || typeof text !== 'string') {
-      return res.status(400).json({ error: 'Missing or invalid text to evaluate' });
-    }
-
-    const activeRules: PromptRule[] = (rules || []).filter(
-      (r: PromptRule) => r.enabled && (r.streamType === 'text' || r.streamType === 'both')
-    );
-
-    if (activeRules.length === 0) {
-      return res.json({
-        success: true,
-        violations: [],
-        message: 'No active text rules configured.',
-      });
-    }
-
-    // Edge check fallback if quota is exceeded
-    if (isQuotaExceeded() || !process.env.GEMINI_API_KEY) {
-      const edgeViolations = evaluateTextEdgeEngine(activeRules, text);
-      return res.json({
-        success: true,
-        timestamp: new Date().toISOString(),
-        violations: edgeViolations,
-        isEdgeFallback: true,
-        quotaNotice: isQuotaExceeded(),
-      });
-    }
-
-    const rulesPromptText = activeRules
-      .map(
-        (r, idx) =>
-          `[Rule ${idx + 1}] ID: "${r.id}" | Name: "${r.name}" | Severity: ${r.severity}
-Condition: "${r.prompt}"`
-      )
-      .join('\n\n');
-
-    const prompt = `Evaluate this text for compliance violations:
-"""${text}"""
-
-Rules:
-${rulesPromptText}
-
-Determine if any rule is violated. Return ruleId, isViolated: true, confidence, excerpt, and explanation. If none, return empty array.`;
-
-    const schema = {
-      type: Type.OBJECT,
-      properties: {
-        violations: {
-          type: Type.ARRAY,
-          items: {
-            type: Type.OBJECT,
-            properties: {
-              ruleId: { type: Type.STRING },
-              isViolated: { type: Type.BOOLEAN },
-              confidence: { type: Type.INTEGER },
-              excerpt: { type: Type.STRING },
-              explanation: { type: Type.STRING },
-            },
-            required: ['ruleId', 'isViolated', 'confidence', 'explanation'],
-          },
-        },
-      },
-      required: ['violations'],
-    };
-
-    const textResponse = await callGeminiSafe({
-      contents: prompt,
-      systemInstruction: 'Authoritative text stream compliance auditor.',
-      responseSchema: schema,
-    });
-
-    if (!textResponse) {
-      const edgeViolations = evaluateTextEdgeEngine(activeRules, text);
-      return res.json({
-        success: true,
-        timestamp: new Date().toISOString(),
-        violations: edgeViolations,
-        isEdgeFallback: true,
-        quotaNotice: isQuotaExceeded(),
-      });
-    }
-
-    let parsed: any = { violations: [] };
-    try {
-      parsed = JSON.parse(textResponse);
-    } catch {
-      parsed = { violations: [] };
-    }
-
-    const confirmed = (parsed.violations || []).filter((v: any) => v.isViolated === true);
-
-    return res.json({
-      success: true,
-      timestamp: new Date().toISOString(),
-      violations: confirmed,
-      isEdgeFallback: false,
-    });
-  } catch (error: any) {
-    console.error('Error evaluating text:', error);
-    const activeRules = (req.body?.rules || []).filter((r: any) => r.enabled);
-    const edgeViolations = evaluateTextEdgeEngine(activeRules, req.body?.text || '');
-    return res.json({
-      success: true,
-      timestamp: new Date().toISOString(),
       violations: edgeViolations,
       isEdgeFallback: true,
     });

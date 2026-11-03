@@ -2,8 +2,6 @@ import React, { useState, useEffect } from 'react';
 import {
   ShieldAlert,
   Eye,
-  MessageSquare,
-  Layers,
   Settings,
   Sparkles,
   Download,
@@ -24,7 +22,6 @@ import { INITIAL_RULES, INITIAL_CAMERAS, INITIAL_GROUPS, PRESET_PACKS } from './
 import { soundFx } from './utils/audioAlert';
 import { MultiCameraMatrix } from './components/MultiCameraMatrix';
 import { FeedViewport } from './components/FeedViewport';
-import { TextStreamViewport } from './components/TextStreamViewport';
 import { RuleManager } from './components/RuleManager';
 import { IncidentAuditFeed } from './components/IncidentAuditFeed';
 import { AnalyticsSummary } from './components/AnalyticsSummary';
@@ -104,7 +101,7 @@ export default function App() {
 
   // Master monitoring state & active view
   const [isMonitoring, setIsMonitoring] = useState<boolean>(true);
-  const [activeTab, setActiveTab] = useState<'matrix' | 'visual' | 'text' | 'split'>('matrix');
+  const [activeTab, setActiveTab] = useState<'matrix' | 'visual'>('matrix');
   const [isMuted, setIsMuted] = useState<boolean>(false);
   const [operationalContext, setOperationalContext] = useState<string>(
     'Multi-Zone Industrial Facility & Examination Complex'
@@ -281,19 +278,6 @@ export default function App() {
 
             <button
               type="button"
-              onClick={() => setActiveTab('split')}
-              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
-                activeTab === 'split'
-                  ? 'bg-slate-800 text-white shadow-sm'
-                  : 'text-slate-400 hover:text-slate-200'
-              }`}
-            >
-              <Layers className="w-3.5 h-3.5 text-indigo-400" />
-              Cockpit
-            </button>
-
-            <button
-              type="button"
               onClick={() => setActiveTab('visual')}
               className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
                 activeTab === 'visual'
@@ -303,19 +287,6 @@ export default function App() {
             >
               <Eye className="w-3.5 h-3.5 text-cyan-400" />
               Spotlight Feed
-            </button>
-
-            <button
-              type="button"
-              onClick={() => setActiveTab('text')}
-              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
-                activeTab === 'text'
-                  ? 'bg-slate-800 text-white shadow-sm'
-                  : 'text-slate-400 hover:text-slate-200'
-              }`}
-            >
-              <MessageSquare className="w-3.5 h-3.5 text-emerald-400" />
-              Text Stream
             </button>
           </div>
 
@@ -370,28 +341,6 @@ export default function App() {
           />
         )}
 
-        {activeTab === 'split' && (
-          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
-            <div className="lg:col-span-7">
-              <FeedViewport
-                rules={rules}
-                onViolationDetected={handleViolationDetected}
-                isMonitoring={isMonitoring}
-                onToggleMonitoring={() => setIsMonitoring(!isMonitoring)}
-                operationalContext={operationalContext}
-              />
-            </div>
-
-            <div className="lg:col-span-5">
-              <TextStreamViewport
-                rules={rules}
-                onViolationDetected={handleViolationDetected}
-                isMonitoring={isMonitoring}
-              />
-            </div>
-          </div>
-        )}
-
         {activeTab === 'visual' && (
           <div className="w-full">
             <FeedViewport
@@ -400,16 +349,6 @@ export default function App() {
               isMonitoring={isMonitoring}
               onToggleMonitoring={() => setIsMonitoring(!isMonitoring)}
               operationalContext={operationalContext}
-            />
-          </div>
-        )}
-
-        {activeTab === 'text' && (
-          <div className="w-full max-w-4xl mx-auto">
-            <TextStreamViewport
-              rules={rules}
-              onViolationDetected={handleViolationDetected}
-              isMonitoring={isMonitoring}
             />
           </div>
         )}

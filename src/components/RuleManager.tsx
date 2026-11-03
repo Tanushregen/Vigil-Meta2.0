@@ -12,7 +12,6 @@ import {
   Layers,
   Wand2,
   Eye,
-  MessageSquare,
   Radio,
 } from 'lucide-react';
 import { PromptRule, RuleSeverity, RuleCategory, StreamType, RuleScope, CameraGroup, CameraFeed } from '../types';
@@ -60,7 +59,7 @@ export const RuleManager: React.FC<RuleManagerProps> = ({
   const [editingPrompt, setEditingPrompt] = useState<string>('');
 
   // Filter state
-  const [filterStream, setFilterStream] = useState<'all' | 'visual' | 'text'>('all');
+  const [filterStream, setFilterStream] = useState<'all' | 'visual'>('all');
 
   const handleCreateSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -336,8 +335,6 @@ export const RuleManager: React.FC<RuleManagerProps> = ({
                   className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2 py-1.5 text-xs text-slate-100 focus:outline-none"
                 >
                   <option value="visual">Visual Feed</option>
-                  <option value="text">Text Stream</option>
-                  <option value="both">Both</option>
                 </select>
               </div>
             </div>
@@ -489,18 +486,6 @@ export const RuleManager: React.FC<RuleManagerProps> = ({
           >
             <Eye className="w-3 h-3" />
             Visual Rules
-          </button>
-          <button
-            type="button"
-            onClick={() => setFilterStream('text')}
-            className={`flex items-center gap-1 px-2.5 py-1 rounded text-[11px] font-medium transition-colors ${
-              filterStream === 'text'
-                ? 'bg-slate-800 text-emerald-300'
-                : 'text-slate-400 hover:text-slate-200'
-            }`}
-          >
-            <MessageSquare className="w-3 h-3" />
-            Text Rules
           </button>
         </div>
       </div>
