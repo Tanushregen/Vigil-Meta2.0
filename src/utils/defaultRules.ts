@@ -167,20 +167,6 @@ export const INITIAL_RULES: PromptRule[] = [
     createdAt: new Date().toISOString(),
     targetScope: 'all',
   },
-  {
-    id: 'rule-text-pii',
-    name: 'Exposed Sensitive PII (SSN, Cards, Credentials)',
-    prompt: 'Alert if the text contains sensitive personally identifiable information, 16-digit credit card numbers, US Social Security Numbers, or raw plaintext passwords.',
-    severity: 'critical',
-    category: 'compliance',
-    streamType: 'text',
-    enabled: true,
-    actionAlarm: true,
-    actionCapture: true,
-    detectionCount: 0,
-    createdAt: new Date().toISOString(),
-    targetScope: 'all',
-  },
 ];
 
 export const PRESET_PACKS = [
