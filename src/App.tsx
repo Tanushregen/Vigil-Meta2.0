@@ -20,6 +20,7 @@ import {
 import { PromptRule, ViolationIncident, CameraFeed, CameraGroup } from './types';
 import { INITIAL_RULES, INITIAL_CAMERAS, INITIAL_GROUPS, PRESET_PACKS } from './utils/defaultRules';
 import { soundFx } from './utils/audioAlert';
+import { preloadSam } from './utils/samSegmenter';
 import { MultiCameraMatrix } from './components/MultiCameraMatrix';
 import { FeedViewport } from './components/FeedViewport';
 import { RuleManager } from './components/RuleManager';
@@ -107,6 +108,17 @@ export default function App() {
     'Multi-Zone Industrial Facility & Examination Complex'
   );
   const [showMetaModal, setShowMetaModal] = useState<boolean>(false);
+
+  // Load SAM in the background as soon as the app opens, so the first scan finds it ready.
+  // Delayed slightly so it never competes with the first paint; skipped on data-saver connections.
+  useEffect(() => {
+    const saveData = (navigator as any).connection?.saveData;
+    if (saveData) return;
+    const t = setTimeout(() => {
+      preloadSam();
+    }, 1500);
+    return () => clearTimeout(t);
+  }, []);
 
   // Sync audio mute
   useEffect(() => {
@@ -386,7 +398,7 @@ export default function App() {
           <span>Multi-Camera Worker Topology Active ({cameras.length} Dedicated Workers)</span>
         </div>
         <div className="text-[11px] text-slate-400">
-          Engineered for Meta Global AI Developer Hackathon • SAM 3.1, Muse Spark & Llama 3.2
+          Engineered for Meta Global AI Developer Hackathon • YOLOv8-Pose, SAM 3 & Muse Spark
         </div>
       </footer>
     </div>

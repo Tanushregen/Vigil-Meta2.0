@@ -31,7 +31,7 @@ export interface BoundingBox {
   label?: string;
 }
 
-export type MetaModelEngine = 'Llama 3.2 Vision' | 'SAM 3.1 + Muse Spark' | 'SAM 3.1 + Llama 3.3';
+export type MetaModelEngine = 'Muse Spark 1.3' | 'Muse Spark 1.2' | 'Muse Spark 1.1';
 
 export interface ViolationIncident {
   id: string;
@@ -71,7 +71,7 @@ export interface CameraFeed {
   id: string;
   name: string;
   group: string;
-  sourceType: 'simulation' | 'webcam' | 'screen';
+  sourceType: 'simulation' | 'webcam' | 'screen' | 'video_file';
   simulationScenario: 'industrial' | 'proctoring' | 'cleanroom';
   worker: CameraWorker;
   isMonitoring: boolean;

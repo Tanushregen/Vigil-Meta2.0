@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState, useCallback } from 'react';
+import React, { useEffect, useRef, useState, useCallback, useSyncExternalStore } from 'react';
 import {
   Camera,
   Monitor,
@@ -20,15 +20,27 @@ import {
   ShieldCheck,
 } from 'lucide-react';
 import { detectFromVideo, loadYolo, YoloDetection } from '../utils/yoloDetector';
-import { loadSam, segmentBoxes, maskedCropDataUrl, getSamBackend, switchSamBackend, cancelSam, SAM_MASK_SIZE, SegmentedTarget } from '../utils/samSegmenter';
+import { detectPoses, loadPoseModel, PoseDetection } from '../utils/poseDetector';
+import {
+  loadSam,
+  segmentBoxes,
+  maskedCropDataUrl,
+  cancelSam,
+  buildPosePoints,
+  preloadSam,
+  getSamModelState,
+  subscribeSamModel,
+  SAM_MASK_SIZE,
+  SegmentedTarget,
+} from '../utils/samSegmenter';
 
 // How long a SAM silhouette stays on screen before the next scan refreshes it
 const MASK_TTL_MS = 8000;
 // Max time a scan waits for SAM before sending plain box crops instead
 const SAM_BUDGET_MS = 8000;
-// SAM starts on the CPU (own worker) so the GPU stays free for YOLO. If a pass takes longer than this the CPU is too
-// weak: move SAM to the GPU, and if that is also too slow, switch it off (stale masks are useless for rules)
-const SAM_SLOW_MS = 12000;
+// SAM 3 runs in its own worker (GPU when available, else CPU). If a pass takes longer than this the device is too weak
+// and masks arrive stale (useless for rules), so SAM switches itself off and scans send plain box crops
+const SAM_SLOW_MS = 20000;
 // Max tracked targets sent to the reasoning model per scan
 const MAX_TARGETS = 6;
 import {
@@ -72,8 +84,8 @@ export const FeedViewport: React.FC<FeedViewportProps> = ({
   const [isEvaluating, setIsEvaluating] = useState<boolean>(false);
   const [lastScanLatency, setLastScanLatency] = useState<number | null>(null);
 
-  // Meta model engine selection: Meta Llama 3.2 Vision, Meta Muse Spark, Meta SAM 3.1
-  const [selectedModel, setSelectedModel] = useState<MetaModelEngine>('Llama 3.2 Vision');
+  // Muse Spark version that judges the rules (Meta Model API)
+  const [selectedModel, setSelectedModel] = useState<MetaModelEngine>('Muse Spark 1.3');
 
   // Bounding box coordinates explicitly nullable to represent reset/null state
   const [activeBoundingBoxes, setActiveBoundingBoxes] = useState<ActiveBox[] | null>(null);
@@ -106,12 +118,17 @@ export const FeedViewport: React.FC<FeedViewportProps> = ({
   const [yoloInfo, setYoloInfo] = useState<{ provider: string; ms: number } | null>(null);
   const yoloStatusRef = useRef<'idle' | 'loading' | 'ready' | 'error'>('idle');
   const yoloDetectionsRef = useRef<{ dets: YoloDetection[]; ts: number }>({ dets: [], ts: 0 });
+  // YOLOv8n-pose: people + 17 real keypoints each (falls back to box-proportion skeletons if it fails to load)
+  const poseDetectionsRef = useRef<{ poses: PoseDetection[]; ts: number }>({ poses: [], ts: 0 });
+  const poseReadyRef = useRef<boolean>(false);
 
-  // SAM 2.1 segmentation stage (box prompts from YOLO tracks -> masks -> background-free crops)
+  // SAM 3 segmentation stage (box prompts from YOLO tracks -> masks -> background-free crops)
   const [samEnabled, setSamEnabled] = useState<boolean>(true);
   const [samStatus, setSamStatus] = useState<'idle' | 'loading' | 'ready' | 'error' | 'slow'>('idle');
   const [samInfo, setSamInfo] = useState<{ provider: string; ms: number } | null>(null);
   const samBusyRef = useRef<boolean>(false);
+  // Whether the SAM model itself is loaded (separate from samStatus, which tracks an in-flight segmentation pass)
+  const samModel = useSyncExternalStore(subscribeSamModel, getSamModelState);
   const trackedPeopleRef = useRef<TrackedPerson[]>([]);
   const maskCacheRef = useRef<Map<number, { canvas: HTMLCanvasElement; box: BoundingBox; ts: number }>>(new Map());
 
@@ -437,19 +454,30 @@ export const FeedViewport: React.FC<FeedViewportProps> = ({
             } else if (yoloStatusRef.current === 'ready') {
               // 2. Webcam / screen / video file: real-time YOLO person detections (cloud AI only judges the rules)
               const { dets, ts } = yoloDetectionsRef.current;
-              const fresh = performance.now() - ts < 1500 ? dets : [];
+              // Objects come from the (less frequent) YOLOv10n pass, so they stay valid for longer than people
+              const fresh = performance.now() - ts < 4000 ? dets : [];
               const phones = fresh.filter((d) => d.label === 'cell phone');
               const overlaps = (a: BoundingBox, b: BoundingBox) =>
                 Math.min(a.xmax, b.xmax) > Math.max(a.xmin, b.xmin) &&
                 Math.min(a.ymax, b.ymax) > Math.max(a.ymin, b.ymin);
-              candidateDetections = fresh
-                .filter((d) => d.label === 'person' && d.score >= trackingSettings.minDetectionConfidence)
-                .map((d) => ({
-                  box: d.box,
-                  score: d.score,
-                  label: 'person',
-                  pose: estimateYoloPose(d.box, { holdingObject: phones.some((ph) => overlaps(ph.box, d.box)) }),
-                }));
+
+              const poseSnap = poseDetectionsRef.current;
+              if (poseReadyRef.current) {
+                // Real network-predicted keypoints per person (shoulders, hips, ... follow the actual body)
+                const people = performance.now() - poseSnap.ts < 1500 ? poseSnap.poses : [];
+                candidateDetections = people
+                  .filter((d) => d.score >= trackingSettings.minDetectionConfidence)
+                  .map((d) => ({ box: d.box, score: d.score, label: 'person', pose: d.pose }));
+              } else {
+                candidateDetections = fresh
+                  .filter((d) => d.label === 'person' && d.score >= trackingSettings.minDetectionConfidence)
+                  .map((d) => ({
+                    box: d.box,
+                    score: d.score,
+                    label: 'person',
+                    pose: estimateYoloPose(d.box, { holdingObject: phones.some((ph) => overlaps(ph.box, d.box)) }),
+                  }));
+              }
 
               // Other COCO objects (phones, laptops, bags, ...) as lightweight outlines
               fresh
@@ -747,7 +775,19 @@ export const FeedViewport: React.FC<FeedViewportProps> = ({
       if (cancelled) return;
       setStatus('ready');
 
+      // Pose model is optional: if it cannot load, people fall back to YOLOv10n boxes with template skeletons
+      let poseProvider = '';
+      try {
+        poseProvider = (await loadPoseModel()).provider;
+        poseReadyRef.current = true;
+      } catch (err) {
+        console.warn('[Pose] YOLOv8n-pose failed to load, using box-proportion skeletons', err);
+        poseReadyRef.current = false;
+      }
+      if (cancelled) return;
+
       let lastHud = 0;
+      let iteration = 0;
       while (!cancelled) {
         const video = feedMode === 'video_file' ? fileVideoRef.current : videoRef.current;
         if (!video || video.readyState < 2 || video.paused || video.ended || !video.videoWidth) {
@@ -756,13 +796,22 @@ export const FeedViewport: React.FC<FeedViewportProps> = ({
         }
         const t0 = performance.now();
         try {
-          const dets = await detectFromVideo(video, { minScore: 0.3 });
-          if (cancelled) return;
+          if (poseReadyRef.current) {
+            const poses = await detectPoses(video, 0.3);
+            if (cancelled) return;
+            poseDetectionsRef.current = { poses, ts: performance.now() };
+          }
+          // Objects (phones, bags, ...) change slowly: every 3rd pass is enough when pose is driving the people
+          if (!poseReadyRef.current || iteration % 3 === 0) {
+            const dets = await detectFromVideo(video, { minScore: 0.3 });
+            if (cancelled) return;
+            yoloDetectionsRef.current = { dets, ts: performance.now() };
+          }
+          iteration++;
           const now = performance.now();
-          yoloDetectionsRef.current = { dets, ts: now };
           if (now - lastHud > 1000) {
             lastHud = now;
-            setYoloInfo({ provider, ms: Math.round(now - t0) });
+            setYoloInfo({ provider: poseReadyRef.current ? poseProvider : provider, ms: Math.round(now - t0) });
           }
         } catch (err) {
           console.warn('[YOLO] inference error', err);
@@ -777,6 +826,7 @@ export const FeedViewport: React.FC<FeedViewportProps> = ({
     return () => {
       cancelled = true;
       yoloDetectionsRef.current = { dets: [], ts: 0 };
+      poseDetectionsRef.current = { poses: [], ts: 0 };
     };
   }, [feedMode, isMonitoring]);
 
@@ -806,13 +856,25 @@ export const FeedViewport: React.FC<FeedViewportProps> = ({
     snap.getContext('2d')?.drawImage(hidden, 0, 0);
 
     let segs: (SegmentedTarget | null)[] = tracks.map(() => null);
-    if (samEnabled && !samBusyRef.current) {
+    // Never make a scan wait for the model to load: until it is ready the scan goes out with plain box crops
+    if (samEnabled && getSamModelState() === 'idle') preloadSam();
+    if (samEnabled && getSamModelState() === 'ready' && !samBusyRef.current) {
       samBusyRef.current = true;
-      setSamStatus((st) => (st === 'ready' ? st : 'loading'));
+      setSamStatus('loading');
       const t0 = performance.now();
+      // Box + click points from real pose keypoints (own torso positive, overlapping people's torsos negative)
       const work = segmentBoxes(
         snap,
-        tracks.map((t) => t.box)
+        tracks.map((t) => ({
+          box: t.box,
+          points: t.pose?.keypoints
+            ? buildPosePoints(
+                t.pose.keypoints,
+                t.box,
+                tracks.filter((o) => o.trackId !== t.trackId && o.pose?.keypoints).map((o) => o.pose!.keypoints)
+              )
+            : undefined,
+        }))
       )
         .then(async (res) => {
           const now = performance.now();
@@ -840,11 +902,7 @@ export const FeedViewport: React.FC<FeedViewportProps> = ({
           });
           const ms = Math.round(now - t0);
           setSamInfo({ provider, ms });
-          if (ms > SAM_SLOW_MS && getSamBackend() === 'cpu' && (navigator as any).gpu) {
-            console.warn(`[SAM] CPU pass took ${ms}ms; moving SAM to the GPU`);
-            switchSamBackend('webgpu');
-            setSamStatus('loading');
-          } else if (ms > SAM_SLOW_MS) {
+          if (ms > SAM_SLOW_MS) {
             console.warn(`[SAM] pass took ${ms}ms on ${provider}; disabling SAM on this device (box crops are used instead)`);
             maskCacheRef.current.clear();
             setSamEnabled(false);
@@ -1050,20 +1108,26 @@ export const FeedViewport: React.FC<FeedViewportProps> = ({
     ]
   );
 
-  // Pausing stops every model: cancel the in-flight Gemini/Llama request, kill any running SAM pass,
+  // Pausing stops every model: cancel the in-flight Muse Spark request, kill any running SAM pass,
   // and drop overlays. YOLO and the scan timer already stop via their own isMonitoring effects.
   useEffect(() => {
     if (isMonitoring) return;
     sourceSessionIdRef.current = Date.now(); // makes any late response from an in-flight scan get discarded
     abortControllerRef.current?.abort();
     abortControllerRef.current = null;
-    cancelSam();
+    // Only tear SAM down if a pass is actually running; an idle, loaded model costs nothing and resumes instantly
+    if (samBusyRef.current) cancelSam();
     samBusyRef.current = false;
     setSamStatus((st) => (st === 'loading' ? 'idle' : st));
     setIsEvaluating(false);
     setActiveBoundingBoxes(null);
     maskCacheRef.current.clear();
   }, [isMonitoring]);
+
+  // Make sure SAM is loaded whenever monitoring is on (covers resume after a pause cancelled it, and re-enabling the toggle)
+  useEffect(() => {
+    if (isMonitoring && samEnabled && feedMode !== 'simulation') preloadSam();
+  }, [isMonitoring, samEnabled, feedMode]);
 
   // Periodically evaluate active frame
   useEffect(() => {
@@ -1270,14 +1334,14 @@ export const FeedViewport: React.FC<FeedViewportProps> = ({
               }}
               className="bg-transparent text-purple-200 text-xs font-semibold focus:outline-none cursor-pointer"
             >
-              <option value="Llama 3.2 Vision" className="bg-slate-900 text-slate-100">
-                Meta Llama 3.2 Vision
+              <option value="Muse Spark 1.3" className="bg-slate-900 text-slate-100">
+                Meta Muse Spark 1.3
               </option>
-              <option value="SAM 3.1 + Muse Spark" className="bg-slate-900 text-slate-100">
-                Meta Muse Spark (SAM 3.1)
+              <option value="Muse Spark 1.2" className="bg-slate-900 text-slate-100">
+                Meta Muse Spark 1.2
               </option>
-              <option value="SAM 3.1 + Llama 3.3" className="bg-slate-900 text-slate-100">
-                Meta Llama 3.3
+              <option value="Muse Spark 1.1" className="bg-slate-900 text-slate-100">
+                Meta Muse Spark 1.1
               </option>
             </select>
           </div>
@@ -1409,7 +1473,7 @@ export const FeedViewport: React.FC<FeedViewportProps> = ({
                 ? 'bg-fuchsia-500/20 text-fuchsia-300 border-fuchsia-500/50'
                 : 'bg-slate-900 text-slate-500 border-slate-800 hover:text-slate-300'
             }`}
-            title="Segment each YOLO box with SAM 2.1 before the rules model sees it"
+            title="Segment each YOLO box with SAM 3 before the rules model sees it"
           >
             <Sparkles className="w-3 h-3" />
             SAM Masks {samEnabled ? 'ON' : 'OFF'}
@@ -1435,7 +1499,7 @@ export const FeedViewport: React.FC<FeedViewportProps> = ({
             >
               <Cpu className="w-3 h-3" />
               {yoloStatus === 'ready' && yoloInfo
-                ? `YOLOv10n · ${yoloInfo.provider} · ${yoloInfo.ms}ms`
+                ? `${poseReadyRef.current ? 'YOLOv8-Pose' : 'YOLOv10n'} · ${yoloInfo.provider} · ${yoloInfo.ms}ms`
                 : yoloStatus === 'error'
                   ? 'YOLO unavailable (cloud boxes)'
                   : 'YOLOv10n loading…'}
@@ -1445,24 +1509,28 @@ export const FeedViewport: React.FC<FeedViewportProps> = ({
           {feedMode !== 'simulation' && (samEnabled || samStatus === 'slow') && (
             <div
               className={`hidden lg:flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-slate-900 border text-[11px] font-mono ${
-                samStatus === 'ready'
-                  ? 'border-fuchsia-500/40 text-fuchsia-300'
-                  : samStatus === 'error'
-                    ? 'border-rose-500/40 text-rose-300'
+                samStatus === 'slow' || samStatus === 'error' || samModel === 'error'
+                  ? 'border-rose-500/40 text-rose-300'
+                  : samModel === 'ready'
+                    ? 'border-fuchsia-500/40 text-fuchsia-300'
                     : 'border-slate-800 text-slate-400'
               }`}
-              title="SAM 2.1 tiny segmenting YOLO boxes before rule evaluation"
+              title="SAM 3 segmenting YOLO boxes before rule evaluation"
             >
               <Sparkles className="w-3 h-3" />
-              {samStatus === 'ready' && samInfo
-                ? `SAM 2.1 · ${samInfo.provider} · ${(samInfo.ms / 1000).toFixed(1)}s`
-                : samStatus === 'error'
+              {samStatus === 'slow'
+                ? 'SAM too slow here (box crops)'
+                : samStatus === 'error' || samModel === 'error'
                   ? 'SAM unavailable (box crops)'
-                  : samStatus === 'slow'
-                    ? 'SAM too slow here (box crops)'
-                  : samStatus === 'loading'
-                    ? 'SAM 2.1 segmenting…'
-                    : 'SAM 2.1 idle'}
+                  : samModel === 'loading'
+                    ? 'SAM 3 loading model…'
+                    : samModel === 'idle'
+                      ? 'SAM 3 idle'
+                      : samStatus === 'loading'
+                        ? 'SAM 3 segmenting…'
+                        : samInfo
+                          ? `SAM 3 · ${samInfo.provider} · ${(samInfo.ms / 1000).toFixed(1)}s`
+                          : 'SAM 3 ready'}
             </div>
           )}
         </div>

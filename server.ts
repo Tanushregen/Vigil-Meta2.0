@@ -3,7 +3,6 @@ import type { Request, Response, NextFunction } from 'express';
 import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { GoogleGenAI, Type } from '@google/genai';
 
 dotenv.config();
 
@@ -40,16 +39,6 @@ app.use((err: any, _req: Request, res: Response, next: NextFunction) => {
   next();
 });
 
-// Initialize GoogleGenAI server-side with telemetry header
-const ai = new GoogleGenAI({
-  apiKey: process.env.GEMINI_API_KEY || '',
-  httpOptions: {
-    headers: {
-      'User-Agent': 'aistudio-build',
-    },
-  },
-});
-
 interface PromptRule {
   id: string;
   name: string;
@@ -72,7 +61,7 @@ function tripQuotaCircuitBreaker(retryAfterSeconds: number = 180) {
   console.warn(`[SentinelPrompt] Cloud API 429 Quota Exceeded. Tripping circuit breaker for ${retryAfterSeconds}s. Gracefully switching to Edge Perception Engine.`);
 }
 
-// Edge Fallback Perception Engine (Emulating Edge SAM 3.1 & ByteTrack Heuristics for Interactive Simulation)
+// Edge Fallback Perception Engine (Emulating Edge simulation engine & ByteTrack Heuristics for Interactive Simulation)
 // For synthetic 2D interactive simulations with known character positions, this maps interactive condition toggles.
 // For real uploaded videos or webcams, this NEVER returns hardcoded coordinates.
 function evaluateFrameEdgeEngine(rules: PromptRule[], context?: string, feedMode: string = 'simulation') {
@@ -96,7 +85,7 @@ function evaluateFrameEdgeEngine(rules: PromptRule[], context?: string, feedMode
           ruleId: rule.id,
           isViolated: true,
           confidence: 96,
-          explanation: 'Edge SAM 3.1 detected personnel head without required OSHA protective safety helmet.',
+          explanation: 'Edge simulation engine detected personnel head without required OSHA protective safety helmet.',
           detectedLabel: 'Unprotected Head',
           box2d: { ymin: 125, xmin: 440, ymax: 260, xmax: 560 },
         });
@@ -234,142 +223,122 @@ function attachTargetBoxes(violations: any[], targets: Array<{ id: number; box: 
   });
 }
 
-// Direct Meta Llama 3.2 Vision / Muse Spark API caller (if user configures META_LLAMA_API_KEY/URL)
-async function callDirectMetaLlamaApi(prompt: string, cleanBase64: string, modelName: string = 'Llama 3.2 Vision', cropImages: string[] = []): Promise<any | null> {
-  const apiKey = process.env.META_LLAMA_API_KEY;
-  if (!apiKey) return null;
+// -----------------------------------------------------------------------------
+// Meta Muse Spark (Meta Model API, Responses API: POST {base}/responses)
+// -----------------------------------------------------------------------------
+const MUSE_DEFAULT_MODEL = 'muse-spark-1.3';
+const MUSE_MODELS: Record<string, string> = {
+  'Muse Spark 1.3': 'muse-spark-1.3',
+  'Muse Spark 1.2': 'muse-spark-1.2',
+  'Muse Spark 1.1': 'muse-spark-1.1',
+};
 
-  const baseUrl = process.env.META_LLAMA_API_URL || 'https://api.together.xyz/v1';
-  // Meta's official Llama API uses bare model ids and serves vision via Llama 4; Together-style hosts use "meta-llama/..." ids.
-  const isOfficialLlamaApi = baseUrl.includes('api.llama.com');
-  const targetModel = process.env.META_LLAMA_MODEL
-    || (isOfficialLlamaApi
-      ? 'Llama-4-Maverick-17B-128E-Instruct-FP8'
-      : modelName.includes('Muse Spark')
-        ? 'meta-llama/Llama-3.3-70B-Instruct'
-        : 'meta-llama/Llama-3.2-11B-Vision-Instruct');
+function metaApiKey(): string {
+  return (process.env.META_API_KEY || process.env.META_LLAMA_API_KEY || '').trim();
+}
 
+function metaApiUrl(): string {
+  return (process.env.META_API_URL || 'https://api.meta.ai/v1').replace(/\/+$/, '');
+}
+
+// UI engine names -> Meta Model API ids. Unknown / legacy names saved in the browser fall back to the default.
+function museModelId(engine?: string): string {
+  return (engine && MUSE_MODELS[engine]) || process.env.MUSE_MODEL || MUSE_DEFAULT_MODEL;
+}
+
+/** Pulls a JSON object out of a model reply, tolerating ```json fences and surrounding prose. */
+function parseModelJson(text: string): any | null {
+  const cleaned = text.replace(/```(?:json)?/gi, '').trim();
+  const start = cleaned.indexOf('{');
+  const end = cleaned.lastIndexOf('}');
+  if (start < 0 || end <= start) return null;
   try {
-    const res = await fetch(`${baseUrl}/chat/completions`, {
+    return JSON.parse(cleaned.slice(start, end + 1));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Calls Muse Spark with optional images (base64 JPEG) and returns the parsed JSON reply, or null on any failure.
+ * Reasoning effort defaults to "minimal" so live scans stay fast (override with MUSE_REASONING).
+ */
+async function callMuseSpark(params: {
+  engine?: string;
+  instructions: string;
+  prompt: string;
+  images?: string[];
+  maxOutputTokens?: number;
+}): Promise<any | null> {
+  const apiKey = metaApiKey();
+  if (!apiKey || isQuotaExceeded()) return null;
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 45000);
+  try {
+    const res = await fetch(`${metaApiUrl()}/responses`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${apiKey}`,
-      },
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+      signal: controller.signal,
       body: JSON.stringify({
-        model: targetModel,
-        messages: [
-          { role: 'system', content: 'You are an authoritative real-time vision compliance auditor. Output strictly JSON with { "violations": [{ "ruleId", "isViolated", "confidence", "explanation", "detectedLabel", "targetId", "box2d": { "ymin", "xmin", "ymax", "xmax" } }], "sceneSummary": "..." } where box2d values are integers 0-1000 and are mandatory for every violation.' },
+        model: museModelId(params.engine),
+        reasoning: { effort: process.env.MUSE_REASONING || 'minimal' },
+        // Reasoning tokens count against this budget, so leave room for the JSON answer
+        max_output_tokens: params.maxOutputTokens ?? 4000,
+        instructions: params.instructions,
+        input: [
           {
             role: 'user',
             content: [
-              { type: 'text', text: prompt },
-              { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${cleanBase64}` } },
-              ...cropImages.map((c) => ({ type: 'image_url', image_url: { url: `data:image/jpeg;base64,${c}` } })),
+              { type: 'input_text', text: params.prompt },
+              ...(params.images || []).map((b64) => ({ type: 'input_image', image_url: `data:image/jpeg;base64,${b64}` })),
             ],
           },
         ],
-        response_format: { type: 'json_object' },
-        temperature: 0.1,
       }),
     });
 
-    if (res.ok) {
-      const data = await res.json();
-      const content = data?.choices?.[0]?.message?.content;
-      if (content) {
-        return JSON.parse(content);
-      }
+    if (res.status === 429) {
+      tripQuotaCircuitBreaker(30);
+      return null;
     }
-  } catch (e) {
-    console.warn('Meta Llama direct API invocation error:', e);
-  }
-  return null;
-}
+    if (!res.ok) {
+      console.warn(`[Muse Spark] HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
+      return null;
+    }
 
-// Resilient Multimodal Engine: Uses gemini-3.1-flash-lite first to avoid 503 high demand spikes,
-// automatically falling back across models seamlessly if any transient 503 is returned.
-async function callGeminiSafe(params: {
-  contents: any;
-  systemInstruction?: string;
-  responseSchema?: any;
-}): Promise<string | null> {
-  if (!process.env.GEMINI_API_KEY || isQuotaExceeded()) {
+    const data: any = await res.json();
+    const text = (data?.output || [])
+      .filter((o: any) => o?.type === 'message')
+      .flatMap((o: any) => o?.content || [])
+      .map((c: any) => c?.text || '')
+      .join('');
+    const parsed = text ? parseModelJson(text) : null;
+    if (!parsed) console.warn(`[Muse Spark] no JSON in reply (status: ${data?.status})`);
+    return parsed;
+  } catch (e: any) {
+    if (e?.name !== 'AbortError') console.warn('[Muse Spark] request failed:', e?.message || e);
     return null;
+  } finally {
+    clearTimeout(timeout);
   }
-
-  // Model cascade: gemini-3.1-flash-lite has massive throughput and rarely spikes with 503,
-  // followed by gemini-flash-latest and gemini-3.8-flash.
-  const candidateModels = [
-    'gemini-3.1-flash-lite',
-    'gemini-2.5-flash',
-    'gemini-flash-latest',
-    'gemini-3.8-flash',
-  ];
-
-  let quotaHits = 0;
-  for (const model of candidateModels) {
-    try {
-      const response = await ai.models.generateContent({
-        model,
-        contents: params.contents,
-        config: {
-          responseMimeType: 'application/json',
-          systemInstruction: params.systemInstruction,
-          responseSchema: params.responseSchema,
-          // Live frames need low latency; skip the reasoning phase on 2.5 models.
-          ...(model.startsWith('gemini-2.5') ? { thinkingConfig: { thinkingBudget: 0 } } : {}),
-        },
-      });
-
-      if (response && response.text) {
-        return response.text;
-      }
-    } catch (err: any) {
-      const errMsg = (err?.message || '').toLowerCase();
-      const is503 = err?.status === 503 || errMsg.includes('503') || errMsg.includes('high demand') || errMsg.includes('unavailable');
-      const is429 = err?.status === 429 || errMsg.includes('429') || errMsg.includes('quota') || errMsg.includes('resource_exhausted');
-
-      if (is503) {
-        // High demand temporary spike on this model: quietly cascade to next model in the pool
-        console.info(`[Meta Cognitive Pipeline] Model ${model} is experiencing high demand (503). Cascading to alternate engine...`);
-        continue;
-      }
-
-      if (is429) {
-        // This model's free-tier quota is spent; other models have separate quotas, so keep cascading.
-        quotaHits++;
-        console.info(`[Meta Cognitive Pipeline] Model ${model} quota exhausted (429). Cascading to alternate engine...`);
-        continue;
-      }
-
-      console.warn(`[Meta Cognitive Pipeline] Engine check for ${model}:`, err?.message || err);
-    }
-  }
-
-  // Back off only when every model was quota-limited, not when a single one was.
-  if (quotaHits === candidateModels.length) {
-    tripQuotaCircuitBreaker(60);
-  }
-
-  return null;
 }
 
 // Health check endpoint
 app.get('/api/health', (_req: Request, res: Response) => {
   res.json({
     status: 'ok',
-    hasApiKey: !!process.env.GEMINI_API_KEY || !!process.env.META_LLAMA_API_KEY,
-    metaLlamaConfigured: !!process.env.META_LLAMA_API_KEY,
+    hasApiKey: !!metaApiKey(),
+    model: museModelId(),
     quotaExceeded: isQuotaExceeded(),
     timestamp: new Date().toISOString(),
   });
 });
 
-// Real-time Visual Frame Violation Evaluation with Meta Llama 3.2 Vision / Muse Spark
+// Real-time Visual Frame Violation Evaluation with Meta Muse Spark
 app.post('/api/evaluate-frame', async (req: Request, res: Response) => {
   try {
-    const { imageBase64, rules, context, feedMode, modelEngine = 'Llama 3.2 Vision', targets: rawTargets, objects: rawObjects } = req.body;
+    const { imageBase64, rules, context, feedMode, modelEngine = 'Muse Spark 1.3', targets: rawTargets, objects: rawObjects } = req.body;
 
     if (!imageBase64 || typeof imageBase64 !== 'string') {
       return res.status(400).json({ error: 'Missing or invalid imageBase64' });
@@ -389,8 +358,7 @@ app.post('/api/evaluate-frame', async (req: Request, res: Response) => {
     }
 
     const isSim = feedMode === 'simulation' || (context && context.toLowerCase().includes('scenario:'));
-    const hasAnyApiKey = (!!process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY.trim() !== '') ||
-                         (!!process.env.META_LLAMA_API_KEY && process.env.META_LLAMA_API_KEY.trim() !== '');
+    const hasAnyApiKey = !!metaApiKey();
 
     // 1. If API key is missing or quota is exceeded:
     if (!hasAnyApiKey || isQuotaExceeded()) {
@@ -423,12 +391,15 @@ app.post('/api/evaluate-frame', async (req: Request, res: Response) => {
     const cleanBase64 = imageBase64.replace(/^data:image\/\w+;base64,/, '');
 
     // Detection -> segmentation hand-off from the browser: YOLO tracks, SAM-refined boxes and masked crops.
-    const targets: Array<{ id: number; label: string; box: { ymin: number; xmin: number; ymax: number; xmax: number }; masked: boolean; crop: string }> = [];
+    const targets: Array<{ id: number; globalId?: number; context?: string; label: string; box: { ymin: number; xmin: number; ymax: number; xmax: number }; masked: boolean; crop: string }> = [];
     for (const t of Array.isArray(rawTargets) ? rawTargets.slice(0, 8) : []) {
       const box = normalizeViolationBox({ box2d: t?.box });
       if (!Number.isInteger(t?.id) || !box || typeof t?.crop !== 'string') continue;
       targets.push({
         id: t.id,
+        globalId: Number.isInteger(t?.globalId) ? t.globalId : undefined,
+        // What the room already knows about this person (other cameras, flagged violations); capped to keep prompts small
+        context: typeof t?.context === 'string' ? t.context.slice(0, 500) : undefined,
         label: String(t.label || 'person').slice(0, 40),
         box,
         masked: !!t.masked,
@@ -441,12 +412,13 @@ app.post('/api/evaluate-frame', async (req: Request, res: Response) => {
     const hasTargets = targets.length > 0;
     const targetPromptText = hasTargets
       ? `
-PRE-DETECTED TARGETS (YOLOv10 detector + SAM 2.1 segmentation, tracked by ID). Boxes are normalized 0-1000 [ymin, xmin, ymax, xmax]:
+PRE-DETECTED TARGETS (YOLOv10 detector + SAM 3 segmentation, tracked by ID). Boxes are normalized 0-1000 [ymin, xmin, ymax, xmax]:
 ${targets
-  .map((t) => `- Target #${t.id} (${t.label}) box [${t.box.ymin}, ${t.box.xmin}, ${t.box.ymax}, ${t.box.xmax}] - ${t.masked ? 'background removed with SAM mask' : 'plain box crop'}; its crop image follows the full frame`)
+  .map((t) => `- Target #${t.id} (${t.label}${t.globalId !== undefined ? `, room-wide person ID ${t.globalId}` : ''}) box [${t.box.ymin}, ${t.box.xmin}, ${t.box.ymax}, ${t.box.xmax}] - ${t.masked ? 'background removed with SAM mask' : 'plain box crop'}; its crop image follows the full frame${t.context ? `
+  Room context: ${t.context}` : ''}`)
   .join('\n')}
 ${objects.length ? `Other detected objects: ${objects.map((o) => `${o.label} (${Math.round(o.score * 100)}%) [${o.box!.ymin}, ${o.box!.xmin}, ${o.box!.ymax}, ${o.box!.xmax}]`).join('; ')}` : ''}
-Judge every rule PER TARGET using its crop (gray background = removed by the mask). When a violation belongs to a target, set "targetId" to that target's ID. Do not return box2d for target violations; the system uses the target's own box. For scene-level rules that no target satisfies (e.g. nobody present, restricted object), omit targetId and give box2d if you can localize it.`
+Judge every rule PER TARGET using its crop (gray background = removed by the mask). Targets with a room-wide person ID are the same individual on every camera; their room context says what other cameras saw and which violations are already ACTIVE. Treat an ACTIVE violation as a lead, not a fact: report it again only if you can see it in this view, otherwise leave it out so it is marked resolved. When a violation belongs to a target, set "targetId" to that target's ID. Do not return box2d for target violations; the system uses the target's own box. For scene-level rules that no target satisfies (e.g. nobody present, restricted object), omit targetId and give box2d if you can localize it.`
       : '';
     const rulesPromptText = activeRules
       .map(
@@ -456,7 +428,7 @@ Condition to detect: "${r.prompt}"`
       )
       .join('\n\n');
 
-    const prompt = `You are an authoritative Meta AI real-time vision compliance auditor (${modelEngine}).
+    const prompt = `You are an authoritative real-time vision compliance auditor (Meta ${modelEngine}).
 Analyze this video frame carefully against the following active prompt rules:
 ${rulesPromptText}
 ${context ? `Operational Environment: ${context}` : ''}${targetPromptText}
@@ -472,77 +444,23 @@ CRITICAL RULES:
    - detectedLabel: brief label (e.g. "Missing Hardhat", "Phone in Hand", "Missing Vest")
    - targetId: ID of the pre-detected target that violates the rule (only when targets are listed above)
    - box2d: REQUIRED unless targetId is set. Tight bounding box {"ymin": int, "xmin": int, "ymax": int, "xmax": int} in normalized image coordinates 0-1000 (origin top-left, ymin/xmin = top-left corner, ymax/xmax = bottom-right corner) around the exact violating person or object. Never omit it.
-DO NOT invent or hallucinate violations that are not visible in the frame. If in doubt or no violation is present, return empty array.`;
+DO NOT invent or hallucinate violations that are not visible in the frame. If in doubt or no violation is present, return empty array.
 
-    // 2. Check if direct Meta Llama API is configured
-    const directMetaResult = await callDirectMetaLlamaApi(prompt, cleanBase64, modelEngine, targets.map((t) => t.crop));
-    if (directMetaResult) {
-      const confirmed = attachTargetBoxes(withNormalizedBoxes((directMetaResult.violations || []).filter((v: any) => v.isViolated === true)), targets);
-      return res.json({
-        success: true,
-        timestamp: new Date().toISOString(),
-        modelEngine: `Meta ${modelEngine}`,
-        sceneSummary: directMetaResult.sceneSummary
-          ? `[Meta ${modelEngine}] ${directMetaResult.sceneSummary}`
-          : `[Meta ${modelEngine}] Real-time inspection evaluated.`,
-        violations: confirmed,
-        isEdgeFallback: false,
-      });
-    }
+Reply with ONLY a JSON object, no prose and no markdown fences:
+{"violations":[{"ruleId":"...","isViolated":true,"confidence":90,"explanation":"...","detectedLabel":"...","targetId":0,"box2d":{"ymin":0,"xmin":0,"ymax":0,"xmax":0}}],"sceneSummary":"one sentence describing the scene"}`;
 
-    // 3. Multimodal Inference with resilient model failover
-    const schema = {
-      type: Type.OBJECT,
-      properties: {
-        violations: {
-          type: Type.ARRAY,
-          items: {
-            type: Type.OBJECT,
-            properties: {
-              ruleId: { type: Type.STRING },
-              isViolated: { type: Type.BOOLEAN },
-              confidence: { type: Type.INTEGER },
-              explanation: { type: Type.STRING },
-              detectedLabel: { type: Type.STRING },
-              targetId: { type: Type.INTEGER },
-              box2d: {
-                type: Type.OBJECT,
-                properties: {
-                  ymin: { type: Type.INTEGER },
-                  xmin: { type: Type.INTEGER },
-                  ymax: { type: Type.INTEGER },
-                  xmax: { type: Type.INTEGER },
-                },
-                required: ['ymin', 'xmin', 'ymax', 'xmax'],
-              },
-            },
-            required: hasTargets
-              ? ['ruleId', 'isViolated', 'confidence', 'explanation', 'detectedLabel']
-              : ['ruleId', 'isViolated', 'confidence', 'explanation', 'detectedLabel', 'box2d'],
-          },
-        },
-        sceneSummary: { type: Type.STRING },
-      },
-      required: ['violations'],
-    };
-
-    const textResponse = await callGeminiSafe({
-      contents: {
-        parts: [
-          { inlineData: { mimeType: 'image/jpeg', data: cleanBase64 } },
-          ...targets.flatMap((t) => [
-            { text: `Crop of Target #${t.id} (${t.label}):` },
-            { inlineData: { mimeType: 'image/jpeg', data: t.crop } },
-          ]),
-          { text: prompt },
-        ],
-      },
-      systemInstruction: `You are the ${modelEngine} real-time vision auditor.`,
-      responseSchema: schema,
+    // 2. Muse Spark judges the rules: full frame first, then one background-removed crop per tracked target
+    const parsedData = await callMuseSpark({
+      engine: modelEngine,
+      instructions: `You are Meta ${modelEngine}, a real-time vision auditor. Output strictly JSON.`,
+      prompt: targets.length
+        ? `${prompt}\n\nImages that follow: first the full frame, then the crop of each target in the order listed: ${targets.map((t) => `#${t.id}`).join(', ')}.`
+        : prompt,
+      images: [cleanBase64, ...targets.map((t) => t.crop)],
     });
 
     // If all cloud endpoints failed or rate-limited
-    if (!textResponse) {
+    if (!parsedData) {
       if (isSim) {
         const edgeViolations = evaluateFrameEdgeEngine(activeRules, context, 'simulation');
         return res.json({
@@ -567,13 +485,6 @@ DO NOT invent or hallucinate violations that are not visible in the frame. If in
       });
     }
 
-    let parsedData: any = { violations: [] };
-    try {
-      parsedData = JSON.parse(textResponse);
-    } catch {
-      parsedData = { violations: [] };
-    }
-
     const confirmed = attachTargetBoxes(withNormalizedBoxes((parsedData.violations || []).filter((v: any) => v.isViolated === true)), targets);
     const summaryText = parsedData.sceneSummary
       ? `[Meta ${modelEngine}] ${parsedData.sceneSummary}`
@@ -592,7 +503,7 @@ DO NOT invent or hallucinate violations that are not visible in the frame. If in
     const activeRules = (req.body?.rules || []).filter((r: any) => r.enabled);
     const isSim = req.body?.feedMode === 'simulation';
     const edgeViolations = isSim ? evaluateFrameEdgeEngine(activeRules, req.body?.context, 'simulation') : [];
-    const modelEngine = req.body?.modelEngine || 'Llama 3.2 Vision';
+    const modelEngine = req.body?.modelEngine || 'Muse Spark 1.3';
     return res.json({
       success: true,
       timestamp: new Date().toISOString(),
@@ -683,45 +594,23 @@ app.post('/api/generate-rules', async (req: Request, res: Response) => {
       ];
     }
 
-    if (isQuotaExceeded() || !process.env.GEMINI_API_KEY) {
+    if (isQuotaExceeded() || !metaApiKey()) {
       return res.json({ success: true, rules: defaultGenerated, isEdgeFallback: true });
     }
 
     const prompt = `A user wants to monitor real-time violations for: "${scenarioDescription}"
-Generate 3 to 4 actionable violation rules with name, prompt, severity (critical, high, medium, low), category (safety, security, compliance, conduct, quality, custom), streamType (visual, text, both).`;
+Generate 3 to 4 actionable violation rules that a camera can check visually. Each rule has: name, prompt (a plain-language condition to detect), severity (critical, high, medium or low), category (safety, security, compliance, conduct, quality or custom) and streamType (always "visual").
+Reply with ONLY a JSON object, no prose and no markdown fences: {"rules":[{"name":"...","prompt":"...","severity":"high","category":"safety","streamType":"visual"}]}`;
 
-    const schema = {
-      type: Type.OBJECT,
-      properties: {
-        rules: {
-          type: Type.ARRAY,
-          items: {
-            type: Type.OBJECT,
-            properties: {
-              name: { type: Type.STRING },
-              prompt: { type: Type.STRING },
-              severity: { type: Type.STRING },
-              category: { type: Type.STRING },
-              streamType: { type: Type.STRING },
-            },
-            required: ['name', 'prompt', 'severity', 'category', 'streamType'],
-          },
-        },
-      },
-      required: ['rules'],
-    };
-
-    const textResponse = await callGeminiSafe({
-      contents: prompt,
-      systemInstruction: 'Safety compliance architect.',
-      responseSchema: schema,
+    const parsed = await callMuseSpark({
+      instructions: 'You are a safety compliance architect. Output strictly JSON.',
+      prompt,
     });
 
-    if (!textResponse) {
+    if (!parsed || !Array.isArray(parsed.rules) || parsed.rules.length === 0) {
       return res.json({ success: true, rules: defaultGenerated, isEdgeFallback: true });
     }
 
-    const parsed = JSON.parse(textResponse);
     return res.json({ success: true, rules: parsed.rules || defaultGenerated, isEdgeFallback: false });
   } catch (error: any) {
     console.error('Error generating rules:', error);
@@ -771,7 +660,14 @@ async function startServer() {
     app.use(vite.middlewares);
   } else {
     const distPath = path.resolve(__dirname, 'dist');
-    app.use(express.static(distPath));
+    // Models and the ONNX runtime are large and never change in place: let browsers keep them for a week
+    app.use(
+      express.static(distPath, {
+        setHeaders: (res, filePath) => {
+          if (/[\\/](models|ort)[\\/]/.test(filePath)) res.setHeader('Cache-Control', 'public, max-age=604800');
+        },
+      })
+    );
     app.get('*', (_req: Request, res: Response) => {
       res.sendFile(path.join(distPath, 'index.html'));
     });

@@ -226,7 +226,7 @@ export const RuleManager: React.FC<RuleManagerProps> = ({
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-1.5 text-xs font-semibold text-indigo-300">
               <Sparkles className="w-4 h-4 text-indigo-400" />
-              <span>AI Rule Generator (Llama 3.3 / Muse Spark Policy Compiler)</span>
+              <span>AI Rule Generator (Muse Spark Policy Compiler)</span>
             </div>
             <button
               type="button"
